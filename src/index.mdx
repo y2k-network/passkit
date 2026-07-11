@@ -1,0 +1,114 @@
+---
+title: Getting started
+description: One pass, two wallets — install @y2k-network/passkit and issue your first pass.
+---
+
+Apple Wallet and Google Wallet are two different, incompatible pass formats
+— different asset models, different field vocabularies, different signing
+schemes. Most integrations either duplicate the pass definition twice or
+build a leaky lowest-common-denominator abstraction that quietly drops data.
+
+`@y2k-network/passkit` instead defines one **neutral intermediate
+representation** (`Pass`) that captures what a pass actually *is* — an
+event ticket, a boarding pass, a coupon; header/primary/secondary/auxiliary/back
+fields; a barcode; relevance triggers; assets — and treats Apple's `.pkpass`
+and Google's Wallet Objects API as two **compile targets** off that one IR.
+Where a target can't represent something the IR expresses, that's not
+silently swallowed: [`Fidelity.audit`](/docs/Fidelity) tells you exactly what
+was dropped, approximated, or resized, and you choose per-call whether
+that's fine, worth a log line, or a hard failure.
+
+```
+        ┌────────────┐
+        │  Template   │  data -> Pass (your layout, once)
+        └──────┬──────┘
+               │
+               ▼
+        ┌────────────┐
+        │    Pass     │  neutral IR
+        └──────┬──────┘
+         ┌──────┴──────┐
+         ▼             ▼
+   Apple.pkpass   Google.saveLink   <- two compile targets
+         │             │
+   .pkpass bytes   save-to-wallet JWT/link
+```
+
+## Install
+
+```bash
+bun add @y2k-network/passkit
+```
+
+`effect` is a peer dependency — you need `effect@^4.0.0-beta.97` (or later
+compatible beta) installed alongside this package. Duplicate `effect`
+instances break its fiber runtime, so a library must peer-depend rather than
+bundle its own copy.
+
+## One pass, two wallets
+
+This is real, verified code — lifted from `test/integration.test.ts`.
+
+```ts
+import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
+
+import { Apple, Barcode, Color, Field, Google, Pass, Template, Wallet } from "@y2k-network/passkit"
+
+// 1. The data you actually have.
+class Attendee extends Schema.Class<Attendee>("Attendee")({
+  name: Schema.NonEmptyString,
+  ticketId: Schema.String
+}) {}
+
+// 2. One Template: data -> Pass IR. This is the only place layout lives.
+const EffectDays = Template.make({
+  id: Template.Id("effect-days-2026"),
+  data: Attendee,
+  render: (a) =>
+    Pass.eventTicket({
+      serial: Pass.Serial(a.ticketId),
+      description: "Effect Days 2026",
+      organization: "Effect Days"
+    }).pipe(
+      Pass.primary(Field.text({ key: "name", label: "ATTENDEE", value: a.name })),
+      Pass.barcode(Barcode.Qr({ content: a.ticketId, altText: a.ticketId })),
+      Pass.colors({ background: Color.hex("#1e1b4b") })
+    )
+})
+
+// 3. Issue once, ship to both wallets, concurrently.
+const program = Effect.gen(function*() {
+  const pass = yield* Template.issue(EffectDays, { name: "Ada Lovelace", ticketId: "TICKET-001" })
+  return yield* Wallet.issue(pass) // { apple: PkPass, google: SaveLink }
+})
+
+const AppleLayer = Apple.layer({
+  teamId: "TEAM123456",
+  passTypeId: "pass.com.acme.tickets",
+  certificate: Apple.Certificate.pem({ cert: leafPem, key: leafKeyPem }),
+  wwdr: wwdrPem
+})
+
+const GoogleLayer = Layer.mergeAll(
+  Layer.succeed(Google.Issuer, { issuerId: "3388000000012345678", serviceAccount }),
+  Google.AssetHost.layerNoop // fine when every asset is Asset.Url
+)
+
+const offer = await Effect.runPromise(program.pipe(Effect.provide(Layer.mergeAll(AppleLayer, GoogleLayer))))
+// offer.apple.bytes      -> write as a .pkpass file / serve with the right content-type
+// offer.google.url       -> redirect the user here ("Add to Google Wallet")
+```
+
+`Wallet.issue` is sugar, not magic: it's exactly `Apple.pkpass` and
+`Google.saveLink` run concurrently via `Effect.all`. Call them directly
+instead if you want per-target options (e.g. a different `onUnsupported`
+policy per wallet, or an Apple web-service URL for push updates).
+
+## Where to go next
+
+- [`Pass`](/docs/Pass) — the IR: five pass kinds, slot combinators, `Pass.validate`.
+- `DESIGN.md` in the repo — the full architecture: why compile targets rather
+  than a shared superset format, the fidelity model, the Apple web-service
+  protocol.

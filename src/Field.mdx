@@ -1,0 +1,151 @@
+---
+title: Field
+description: Typed field values — text, date, number, currency — with branded keys and per-target rendering.
+---
+
+A `Field` is not a string. It is a typed value that each compile target
+formats natively: Apple ships the raw value plus formatting hints
+(`dateStyle`, `currencyCode`) in `pass.json` and lets the *device* localize
+it at display time; Google pre-renders the value through `Intl` once, at
+compile time, and ships a plain string. Same `Field`, two very different
+rendering philosophies — see [Fidelity](/docs/Fidelity) if you want the
+formal audit of what else diverges like this.
+
+## Constructors
+
+```ts
+import { describe, expect, test } from "bun:test"
+import * as BigDecimal from "effect/BigDecimal"
+import * as DateTime from "effect/DateTime"
+import { Field } from "@y2k-network/passkit"
+
+const seat = Field.text({ key: "seat", label: "SEAT", value: "14C" })
+
+const departs = Field.date({
+  key: "departs",
+  value: DateTime.makeUnsafe("2026-01-01T00:00:00Z")
+})
+
+const points = Field.number({ key: "points", value: 8250 })
+
+const balance = Field.currency({
+  key: "balance",
+  value: BigDecimal.make(2450n, 2),
+  currency: "USD"
+})
+```
+
+Four variants, one per `FieldValue` tag (`Text`, `Date`, `Number`,
+`Currency`) — a `Data.taggedEnum` under the hood, so `Field.isText` /
+`Field.isDate` / `Field.isNumber` / `Field.isCurrency` narrow on `field.value`
+the way you'd expect:
+
+```ts
+test("typed values narrow by tag", () => {
+  expect(Field.isText(seat.value)).toBe(true)
+  expect(Field.isDate(departs.value)).toBe(true)
+  expect(Field.isNumber(points.value)).toBe(true)
+  expect(Field.isCurrency(balance.value)).toBe(true)
+})
+```
+
+`currency` is backed by Effect's `BigDecimal`, not `number` — wallet
+balances shouldn't be subject to float drift. `date` takes a real
+`DateTime.DateTime`, not a timestamp or an ISO string.
+
+## `Field.Key` — branded and unique
+
+```ts
+test("key is branded and non-empty", () => {
+  const k = Field.Key("gate")
+  expect(String(k)).toBe("gate")
+})
+```
+
+Every `text`/`date`/`number`/`currency` constructor brands its `key` for
+you; `Field.Key` is exposed directly for cases where you need to construct
+or compare a key on its own. Branding only guarantees non-emptiness —
+*uniqueness* across every slot in a pass is a pass-level invariant, checked
+by [`Pass.validate`](/docs/Pass#passvalidate), which every compile
+entrypoint runs first. A duplicate key anywhere in `header` / `primary` /
+`secondary` / `auxiliary` / `back` fails validation before it ever reaches
+Apple or Google — not discovered at either platform's door.
+
+## Change messages
+
+```ts
+test("changed attaches a changeMessage", () => {
+  const f = Field.text({ key: "gate", value: "B42" })
+  const changed = Field.changed(f, "Gate changed to %@")
+  expect(String(changed.changeMessage)).toBe("Gate changed to %@")
+  expect(f.changeMessage).toBeUndefined()
+})
+```
+
+`Field.changed` is a pure, immutable update — it returns a new `Field`,
+`changeMessage` and all; the original is untouched. `changeMessage` is
+Apple's update-notification template (`%@` is replaced with the field's new
+value when a push-triggered pass update changes this field). Google Wallet
+has no equivalent mechanism; the field just changes value silently there.
+
+## How each target renders a value
+
+This is the asymmetry the module exists to encode:
+
+- **Apple** writes the typed value plus formatting *hints* into `pass.json`
+  (`dateStyle`/`timeStyle` for dates, `currencyCode` for currency,
+  `numberStyle` for numbers) and lets the device format it — so a `Date`
+  field shows up in the wallet holder's locale and 12h/24h preference, not
+  whatever locale compiled the pass.
+- **Google** has no such hook in the Wallet Objects API — text fields are
+  just text. So the target resolves the value through `Intl.DateTimeFormat`
+  / `Intl.NumberFormat` once, at compile time, using a fixed locale, and
+  ships the resulting string. Whatever locale you compile with is the
+  locale every Google Wallet holder sees.
+
+Practically: pick `date`/`time` style and `currency` code the same way for
+both targets, but know that only Apple's rendering adapts to the end user;
+Google's is baked in at `Google.saveLink`/`Google.sync` time.
+
+## Wire encoding (`Field.Schema`)
+
+`Field` composes into [`Pass.Schema`](/docs/Pass#serialization) for
+round-tripping through a database or queue. Because `Data.taggedEnum`
+values don't decode/encode through `Schema.declare` directly in this v4
+beta, `Field.FieldSchema` decodes/encodes a structurally-equivalent plain
+tagged struct:
+
+```ts
+import * as Schema from "effect/Schema"
+
+test("schema round-trips a text field", () => {
+  const f = Field.text({ key: "seat", label: "SEAT", value: "14C" })
+  const encoded = Schema.encodeSync(Field.FieldSchema)(f as any)
+  const decoded = Schema.decodeUnknownSync(Field.FieldSchema)(encoded)
+  expect(String(decoded.key)).toBe("seat")
+  expect(decoded.value).toEqual({ _tag: "Text", text: "14C" })
+})
+
+test("currency and date fields encode to JSON-primitive strings", () => {
+  const c = Field.currency({ key: "balance", value: BigDecimal.make(2450n, 2), currency: "USD" })
+  const cEncoded = Schema.encodeSync(Field.FieldSchema)(c as any) as any
+  expect(typeof cEncoded.value.value).toBe("string")
+
+  const d = Field.date({ key: "departs", value: DateTime.makeUnsafe("2026-01-01T00:00:00Z") })
+  const dEncoded = Schema.encodeSync(Field.FieldSchema)(d as any) as any
+  expect(typeof dEncoded.value.value).toBe("string")
+})
+```
+
+`Date` values encode as ISO-8601 strings (`Schema.DateTimeUtcFromString`)
+and `Currency` values encode as decimal strings
+(`Schema.BigDecimalFromString`) — both JSON-primitive, both decoding back to
+real `DateTime`/`BigDecimal` values, not stringly-typed approximations. That
+means a `Field` survives `JSON.stringify` / `JSON.parse` intact.
+
+## See also
+
+- [Pass](/docs/Pass) — slots hold `Field`s; `Pass.validate` enforces key
+  uniqueness and slot arity.
+- [Fidelity](/docs/Fidelity) — the formal record of what compiles losslessly
+  to each target and what doesn't.

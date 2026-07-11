@@ -42,3 +42,9 @@ HOW_TO_RENEW.md
 # editor
 .cursor/
 
+# docs/ — standalone Fumadocs (Next.js) app, own lockfile/build output
+docs/node_modules
+docs/.next
+docs/.source
+docs/next-env.d.ts
+

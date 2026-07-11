@@ -1,0 +1,187 @@
+---
+title: Pass
+description: The neutral pass IR — five kinds, slot combinators, and Pass.validate.
+---
+
+`Pass` is the intermediate representation every compile target (`Apple.pkpass`,
+`Google.saveLink`, `Wallet.issue`) is built from. It is pure, `Schema`-backed
+data — no target-specific concerns leak in here.
+
+## Kinds
+
+Five kinds, one constructor per kind. The kind is a tag, and kind-specific
+requirements are captured at construction — a boarding pass *cannot exist*
+without a transit mode:
+
+```ts
+import { describe, expect, test } from "bun:test"
+import { Pass } from "@y2k-network/passkit"
+
+test("eventTicket", () => {
+  const p = Pass.eventTicket({ serial: Pass.Serial("TKT-1"), description: "Effect Days" })
+  expect(String(p._tag)).toBe("EventTicket")
+  expect(String(p.serial)).toBe("TKT-1")
+  expect(p.slots.header).toEqual([])
+})
+
+test("boardingPass requires a transit mode", () => {
+  const p = Pass.boardingPass({ serial: Pass.Serial("BP-1"), description: "SFO -> JFK", transit: "air" })
+  expect(String(p._tag)).toBe("BoardingPass")
+  expect(String(p.transit)).toBe("air")
+})
+
+test("coupon / storeCard / generic", () => {
+  expect(Pass.coupon({ serial: Pass.Serial("C-1"), description: "10% off" })._tag).toBe("Coupon")
+  expect(Pass.storeCard({ serial: Pass.Serial("S-1"), description: "Loyalty" })._tag).toBe("StoreCard")
+  expect(Pass.generic({ serial: Pass.Serial("G-1"), description: "Misc" })._tag).toBe("Generic")
+})
+```
+
+| Constructor         | Extra surface                                                          |
+| -------------------- | ---------------------------------------------------------------------- |
+| `Pass.eventTicket`  | `Pass.venue`, `Pass.seat` (semantics, available on every kind)         |
+| `Pass.boardingPass` | requires `transit: "air" \| "train" \| "bus" \| "boat"`; `Pass.origin`/`Pass.destination` (paired primary slot) |
+| `Pass.coupon`       | `Pass.expires` (rides the secondary slot; no dedicated semantic slot yet) |
+| `Pass.storeCard`    | `Pass.balance` (replaces the primary slot, arity 1)                    |
+| `Pass.generic`      | nothing extra — the escape hatch                                        |
+
+## Slots, not children
+
+A pass is not a tree; it is a fixed set of slots (`header`, `primary`,
+`secondary`, `auxiliary`, `back`) with per-kind arity rules. Slot combinators
+are dual (data-first and data-last, `dual`-style) and stay total, pure
+appends — they do **not** check arity or key uniqueness themselves. Those
+invariants are enforced by `Pass.validate` (see below).
+
+The `Slots` and `Colors` shapes, generated straight from `Pass.ts`:
+
+<AutoTypeTable path="../src/Pass.ts" name="Slots" />
+
+<AutoTypeTable path="../src/Pass.ts" name="Colors" />
+
+```ts
+import * as Effect from "effect/Effect"
+import { Asset, Barcode, Color, Field, Pass } from "@y2k-network/passkit"
+
+// data-last (pipe) style
+const p = Pass.eventTicket({ serial: Pass.Serial("TKT-2"), description: "Effect Days" }).pipe(
+  Pass.header(Field.text({ key: "gate", label: "GATE", value: "B42" })),
+  Pass.primary(Field.text({ key: "event", label: "EVENT", value: "Effect Days 2026" })),
+  Pass.secondary(
+    Field.text({ key: "doors", label: "DOORS", value: "7:00 PM" }),
+    Field.text({ key: "section", label: "SECTION", value: "GA" })
+  ),
+  Pass.back(Field.text({ key: "terms", label: "Terms", value: "Non-transferable." })),
+  Pass.barcode(Barcode.Qr({ content: "TKT-2", altText: "TKT-2" })),
+  Pass.colors({
+    background: Color.hex("#1e1b4b"),
+    foreground: Color.hex("#ffffff"),
+    label: Color.hex("#a5b4fc")
+  }),
+  Pass.logo(Asset.file("assets/logo.png")),
+  Pass.icon(Asset.file("assets/icon.png"), { "2x": Asset.file("assets/icon@2x.png") }),
+  Pass.venue({ name: "Kraftwerk Berlin" }),
+  Pass.seat({ section: "GA" })
+)
+
+// data-first style produces the same result as data-last
+const base = Pass.eventTicket({ serial: Pass.Serial("TKT-3"), description: "Effect Days" })
+const field = Field.text({ key: "gate", value: "B42" })
+
+const viaPipe = base.pipe(Pass.header(field))
+const viaDataFirst = Pass.header(base, field)
+// viaPipe.slots.header equals viaDataFirst.slots.header
+```
+
+`storeCard` replaces the primary slot (arity 1) with `Pass.balance`, and
+`boardingPass` uses a paired primary slot via `Pass.origin`/`Pass.destination`:
+
+```ts
+import * as BigDecimal from "effect/BigDecimal"
+
+const card = Pass.storeCard({ serial: Pass.Serial("S-2"), description: "Loyalty" }).pipe(
+  Pass.balance(Field.currency({ key: "balance", value: BigDecimal.make(2450n, 2), currency: "USD" }))
+)
+// card.slots.primary has length 1
+
+const bp = Pass.boardingPass({ serial: Pass.Serial("BP-2"), description: "SFO -> JFK", transit: "air" }).pipe(
+  Pass.origin(Field.text({ key: "origin", value: "SFO" })),
+  Pass.destination(Field.text({ key: "destination", value: "JFK" }))
+)
+// bp.slots.primary has length 2: [origin, destination]
+```
+
+## `Pass.validate`
+
+Every compile entrypoint (`Apple.pkpass`, `Google.saveLink`, `Google.sync`,
+`Template.issue`/`issueAll`) runs `Pass.validate` as its first step, so
+nothing malformed reaches a target compiler. It checks two things: duplicate
+field keys across every slot, and per-kind slot arity limits (e.g. an event
+ticket allows one primary field; a boarding pass allows two).
+
+```ts
+test("passes valid pass", async () => {
+  const p = Pass.eventTicket({ serial: Pass.Serial("TKT-4"), description: "Effect Days" }).pipe(
+    Pass.header(Field.text({ key: "gate", value: "B42" }))
+  )
+  const result = await Effect.runPromise(Pass.validate(p))
+  expect(result).toBe(p)
+})
+
+test("fails on duplicate keys", async () => {
+  const p = Pass.eventTicket({ serial: Pass.Serial("TKT-5"), description: "Effect Days" }).pipe(
+    Pass.header(Field.text({ key: "gate", value: "B42" })),
+    Pass.secondary(Field.text({ key: "gate", value: "duplicate" }))
+  )
+  const exit = await Effect.runPromiseExit(Pass.validate(p))
+  expect(String(exit._tag)).toBe("Failure") // PassValidationError: DuplicateKey
+})
+
+test("fails on header slot overflow (limit 3)", async () => {
+  const p = Pass.eventTicket({ serial: Pass.Serial("TKT-6"), description: "Effect Days" }).pipe(
+    Pass.header(
+      Field.text({ key: "a", value: "1" }),
+      Field.text({ key: "b", value: "2" }),
+      Field.text({ key: "c", value: "3" }),
+      Field.text({ key: "d", value: "4" })
+    )
+  )
+  const exit = await Effect.runPromiseExit(Pass.validate(p))
+  expect(String(exit._tag)).toBe("Failure") // PassValidationError: SlotOverflow
+})
+
+test("fails on eventTicket primary overflow (limit 1) but boardingPass allows 2", async () => {
+  const ticket = Pass.eventTicket({ serial: Pass.Serial("TKT-7"), description: "Effect Days" }).pipe(
+    Pass.primary(Field.text({ key: "a", value: "1" }), Field.text({ key: "b", value: "2" }))
+  )
+  const ticketExit = await Effect.runPromiseExit(Pass.validate(ticket))
+  expect(String(ticketExit._tag)).toBe("Failure")
+
+  const boarding = Pass.boardingPass({ serial: Pass.Serial("BP-3"), description: "x", transit: "air" }).pipe(
+    Pass.primary(Field.text({ key: "a", value: "1" }), Field.text({ key: "b", value: "2" }))
+  )
+  const boardingResult = await Effect.runPromise(Pass.validate(boarding))
+  // boardingResult.slots.primary has length 2
+})
+```
+
+`Pass.ValidationError` is a `Data.TaggedError` (`_tag: "PassValidationError"`)
+carrying either a `DuplicateKey` or `SlotOverflow` reason.
+
+## Serialization
+
+The whole IR is `Schema`-backed (`Pass.Schema`) — decode a `Pass` from a
+database row or queue message, encode it back to plain JSON-safe data to
+store it. `Field.date` values encode as ISO-8601 strings
+(`Schema.DateTimeUtcFromString`) and `Field.currency` values encode as
+decimal strings (`Schema.BigDecimalFromString`), both decoding back to real
+`DateTime`/`BigDecimal` values. `Barcode`, `Field`, and `Asset` are
+`Data.taggedEnum`s with companion schemas (`FieldSchema`, `BarcodeSchema`,
+`AssetSchema`) that `Pass.Schema` composes. See `test/PassCodec.test.ts` for
+a literal `JSON.stringify`/`JSON.parse` round trip.
+
+## See also
+
+- [Getting started](/docs) — the flagship one-pass-two-wallets example.
+- `DESIGN.md` §3.1 in the repo — full design rationale for slots vs. children,
+  the dual-combinator API, and the `Schema` round-trip guarantee.

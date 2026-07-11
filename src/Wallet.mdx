@@ -1,0 +1,161 @@
+---
+title: Wallet
+description: Issue a Pass to both Apple and Google Wallet in one call — sugar, not magic.
+---
+
+`Wallet` is the two-for-one facade across both compile targets. There's
+exactly one function in it — `Wallet.issue` — and it exists because "give me
+both artifacts" is the common case, not because the per-target APIs need
+hiding. [`Apple.pkpass`](/docs/Apple) and [`Google.saveLink`](/docs/Google)
+are the real API; `Wallet.issue` just runs them together.
+
+## `issue`
+
+```ts
+import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+
+import { Apple, Google, Wallet } from "@y2k-network/passkit"
+
+const offer = await Effect.runPromise(
+  Wallet.issue(pass).pipe(
+    Effect.provide(Layer.mergeAll(AppleLayer, GoogleLayer))
+  )
+)
+
+offer.apple.bytes  // .pkpass bytes — write to a file or serve with the right content-type
+offer.google.url   // "Add to Google Wallet" redirect target
+```
+
+The implementation is literally this — no hidden retries, no third target,
+no sequencing:
+
+```ts
+export const issue = (pass, options) => {
+  const policy = options?.onUnsupported ?? "warn"
+
+  const appleEffect = Apple.pkpass(pass, {
+    webService: options?.apple?.webService,
+    onUnsupported: policy
+  })
+
+  const googleEffect = Google.saveLink(pass, {
+    origins: options?.google?.origins,
+    classSuffix: options?.google?.classSuffix,
+    onUnsupported: policy
+  })
+
+  return Effect.all({ apple: appleEffect, google: googleEffect }, { concurrency: "unbounded" })
+}
+```
+
+Both compiles run concurrently via `Effect.all` with `{ concurrency:
+"unbounded" }` — there are only ever two tasks, so "unbounded" just means
+"don't serialize them." If you need a different `onUnsupported` policy per
+wallet, or an Apple web-service URL only on one side, call `Apple.pkpass`
+and `Google.saveLink` directly instead — `Wallet.issue`'s uniform `options`
+can't express that split.
+
+## `Offer`
+
+```ts
+export interface Offer {
+  readonly apple: Apple.PkPass
+  readonly google: Google.SaveLink
+}
+```
+
+Both fields are always present — `Wallet.issue` either produces both or
+fails; there's no partial result. If you need "ship whichever wallet
+succeeds," compose `Effect.either`/`Effect.exit` around the individual
+`Apple.pkpass`/`Google.saveLink` calls yourself.
+
+## `IssueOptions`
+
+<AutoTypeTable path="../src/Wallet.ts" name="IssueOptions" />
+
+`onUnsupported` (`"warn" | "ignore" | "error"`, default `"warn"`) is the one
+option `Wallet.issue` actually interprets — the [`Fidelity`](/docs/Fidelity)
+policy for what happens when the `Pass` uses a feature one target can't
+represent (e.g. beacon relevance, which Google Wallet has no equivalent
+for). It's applied identically to both targets; `google` and `apple` under
+it are just pass-through option bags for each compiler.
+
+## One pass, two wallets
+
+Lifted from `test/integration.test.ts` — `Template.issue` renders the IR,
+`Wallet.issue` compiles it to both targets concurrently:
+
+```ts
+const pass = await Effect.runPromise(
+  Template.issue(EffectDays, { name: "Grace Hopper", ticketId: "TICKET-002" })
+)
+
+const signerLayer = Apple.layer({
+  teamId: "TEAM123456",
+  passTypeId: "pass.com.acme.tickets",
+  certificate: Apple.Certificate.pem({ cert: chain.leafPem, key: chain.leafKeyPem }),
+  wwdr: chain.wwdrPem
+})
+
+const issuerLayer = Layer.succeed(Google.Issuer, {
+  issuerId: "3388000000012345678",
+  serviceAccount
+})
+
+const offer = await Effect.runPromise(
+  Wallet.issue(pass).pipe(
+    Effect.provide(Layer.mergeAll(signerLayer, issuerLayer, Google.AssetHost.layerNoop))
+  )
+)
+
+offer.apple.contentType // "application/vnd.apple.pkpass"
+offer.google.url        // `https://pay.google.com/gp/v/save/${offer.google.jwt}`
+```
+
+## Errors and requirements
+
+`Wallet.issue`'s error and requirement types are exactly the union of what
+each target needs — no new error type is introduced:
+
+```ts
+Effect.Effect<
+  Offer,
+  Apple.PkpassError | Google.IssueError,
+  Apple.Signer | Google.Issuer | Google.AssetHost
+>
+```
+
+Because both branches run under one `Effect.all`, a failure on either side
+fails the whole call — you get the first error, tagged, and can
+`catchTag`/`catchTags` on the union same as any other Effect program. From
+`test/Wallet.test.ts`, catching a `Fidelity` rejection under `onUnsupported:
+"error"`:
+
+```ts
+const caught: Fidelity.UnsupportedError | undefined = await program.pipe(
+  Effect.catchTag("FidelityUnsupportedError", (error) => {
+    caught = error
+    return Effect.void
+  }),
+  Effect.catchTag("AppleAssetResolveError", () => Effect.void),
+  Effect.catchTag("GoogleMissingAssetHostError", () => Effect.void),
+  Effect.catchTag("GoogleAssetUploadError", () => Effect.void),
+  Effect.catchTag("PassValidationError", () => Effect.void),
+  Effect.catchTag("ServiceAccountError", () => Effect.void),
+  Effect.catchTag("JwtError", () => Effect.void),
+  Effect.catchTag("SigningError", () => Effect.void)
+)
+```
+
+Every tag in that list is a real member of the combined error union — Effect
+won't let the program compile until every failure mode is either handled or
+left in the return type. Long as it looks, that list *is* the documentation
+of everything that can go wrong issuing to both wallets at once.
+
+## See also
+
+- [Getting started](/docs) — the flagship one-pass-two-wallets walkthrough.
+- [`Apple`](/docs/Apple) / [`Google`](/docs/Google) — the two compile targets, and their per-target options.
+- [`Fidelity`](/docs/Fidelity) — what `onUnsupported` is actually policing.
+- [`Template`](/docs/Template) — turning your own data into a `Pass` before issuing it.

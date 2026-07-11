@@ -1,0 +1,88 @@
+---
+title: Semantics
+description: Machine-readable meaning — seat, venue, event name — that fans out to Apple semanticTags and Google structured fields.
+---
+
+Both platforms increasingly want *semantic* data, not just display text —
+Apple's `semanticTags` and Google's structured object fields power Siri
+Shortcuts, Assistant, Live Activities, and search, none of which can parse a
+label like `"SEAT: 14C"` back into a seat number. `Semantics` is one small,
+neutral declaration that fans out to both dialects instead of you writing
+two.
+
+## Shape
+
+<AutoTypeTable path="../src/Semantics.ts" name="Semantics" />
+
+Deliberately minimal to start — both platforms' semantic vocabularies keep
+growing, and this is where that growth lands as it's needed, not a
+pre-emptive kitchen sink.
+
+## Attaching semantics to a pass
+
+`Pass.seat` and `Pass.venue` are available on **every** [`Pass`](/docs/Pass)
+kind — they write to `pass.semantics`, not a kind-specific slot:
+
+```ts
+import { Pass } from "@y2k-network/passkit"
+
+const p = Pass.eventTicket({ serial: Pass.Serial("TKT-2"), description: "Effect Days" }).pipe(
+  Pass.venue({ name: "Kraftwerk Berlin" }),
+  Pass.seat({ section: "GA" })
+)
+```
+
+```ts
+test("attaches semantics", () => {
+  const p = Pass.eventTicket({ serial: Pass.Serial("TKT-2"), description: "Effect Days" }).pipe(
+    Pass.venue({ name: "Kraftwerk Berlin" }),
+    Pass.seat({ section: "GA" })
+  )
+  expect(String(p.semantics.venue?.name)).toBe("Kraftwerk Berlin")
+  expect(String(p.semantics.seat?.section)).toBe("GA")
+})
+```
+
+Both combinators are `dual`-style and merge into the existing `semantics`
+object rather than replacing it — calling `Pass.seat` doesn't clobber a
+`venue` set earlier.
+
+`Semantics.seat(args)` and `Semantics.venue(args)` are the plain builders
+behind the combinators (they're identity functions today — `Seat`/`Venue`
+are structural, not branded — but going through them keeps call sites
+readable and gives the shapes a stable name to import).
+
+## Why semantics beat markup
+
+Without `Semantics`, "seat 14C, row F, section GA" is three strings baked
+into `Field.text` labels — readable by a human, opaque to the OS. With it,
+one declaration:
+
+```ts
+Pass.seat({ section: "GA", row: "F", seat: "14C" })
+```
+
+compiles to Apple's `semanticTags.seat` structure (`Apple.pkpass`) *and*
+Google's `eventTicketObject.seatInfo` (`Google.saveLink`) — the same
+compile-target split as everything else in the IR. You write the meaning
+once; each target's formatter/renderer decides how to surface it (Siri
+answering "where do I sit?", Assistant surfacing the venue address, whatever
+each platform's semantic consumers do with it).
+
+`eventName` is a plain string alias (`Semantics.EventName`) rather than a
+branded type — it exists to give `semantics.eventName` a named slot without
+inventing ceremony around what is, structurally, just a string.
+
+## Serialization
+
+`SemanticsSchema` is a plain `Schema.Struct` (no tagged union — unlike
+`Asset`/`Barcode`/`Field`/`Relevance`, `Semantics` isn't a `Data.TaggedEnum`,
+it's a single optional-fields record), composed of `SeatSchema` and
+`VenueSchema`. `Pass.Schema` includes it directly as `pass.semantics` — no
+special round-trip cases, since every field here is already a plain string.
+
+## See also
+
+- [`Pass`](/docs/Pass) — `Pass.seat`/`Pass.venue`, and where `semantics` sits in the IR (§ Slots, not children — semantics live outside the slot system entirely).
+- [`Apple`](/docs/Apple) — where `semantics.seat`/`venue` land as `semanticTags`.
+- [`Google`](/docs/Google) — where they land as structured event ticket / offer fields.

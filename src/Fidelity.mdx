@@ -1,0 +1,189 @@
+---
+title: Fidelity
+description: Lossiness as data — audit cross-compilation loss and enforce a policy on it.
+---
+
+Compiling the neutral [`Pass`](/docs/Pass) IR to Apple or Google is lossy in
+both directions: Google has no iBeacon relevance, no label color, no
+icon/thumbnail field, and takes exactly one image per role; Apple has one
+strip/background slot where Google effectively has two candidate sources
+(strip, hero). A library that quietly drops what a target can't represent is
+lying to you by omission. `Fidelity` makes the loss a first-class, inspectable
+value instead: `audit` a pass and get back a `Report` of `Finding`s, then
+`enforce` a policy — ignore it, log it, or fail loudly — at the call site
+that actually knows whether it matters.
+
+The headline guarantee: **the compiler and the audit agree, because the
+compiler runs the audit.** `Apple.pkpass` and `Google.saveLink` call
+`Fidelity.audit` on the validated pass as an internal step, before doing any
+target-specific work. `Fidelity.audit` isn't a separate best-effort static
+checker that can drift out of sync with what `internal/*/compile.ts`
+actually does — the rules in this module describe the exact same
+lossy mappings the compilers implement (e.g. "strip wins when both strip and
+hero are set" is a fact `googleStripDroppedWhenHeroPresent` and
+`internal/google/compile.ts` both encode, and the test suite pins both to
+the same reality).
+
+## `Fidelity.audit`
+
+Pure — no `Effect`, no I/O. Give it a `Pass`, get back a `Report`:
+
+```ts
+export interface Report {
+  readonly apple: ReadonlyArray<Finding>
+  readonly google: ReadonlyArray<Finding>
+}
+```
+
+```ts
+import { Asset, Color, Field, Fidelity, Pass, Relevance } from "@y2k-network/passkit"
+
+const lossyPass = Pass.eventTicket({ serial: Pass.Serial("TKT-1"), description: "Effect Days" }).pipe(
+  Pass.relevant(Relevance.beacon({ proximityUUID: "uuid-1" })),
+  Pass.secondary(Field.changed(Field.text({ key: "gate", label: "GATE", value: "B42" }), "Gate changed to %@")),
+  Pass.strip(Asset.file("strip.png"), { "2x": Asset.file("strip@2x.png") }),
+  Pass.hero(Asset.file("hero.png")),
+  Pass.colors({ label: Color.hex("#ff0000") })
+)
+
+const report = Fidelity.audit(lossyPass)
+// report.google: [Dropped beacon, Approximated changeMessage, Dropped strip (hero wins),
+//                 Dropped strip@2x density, Dropped label color]
+// report.apple:  [Dropped hero (strip wins)]
+```
+
+A clean pass — nothing beyond what both targets natively support — audits to
+empty arrays on both sides.
+
+## `Finding`
+
+Three variants, a `Data.TaggedEnum`, each naming the exact `path` into the
+`Pass` and a human `reason`:
+
+<AutoTypeTable path="../src/Fidelity.ts" name="Finding" />
+
+- **`Dropped`** — the feature has no replacement on the target. Beacon
+  relevance on Google, `colors.label` on Google, icon/thumbnail on Google,
+  density variants beyond the first image, hero-vs-strip loser.
+- **`Approximated`** — mapped onto something else, lossy but present.
+  `changeMessage` becomes a generic push-notification string on Google
+  (no per-field update template there); `strip` maps onto Google's single
+  `heroImage` slot when `hero` itself is unset.
+- **`Resized`** — size/shape altered to fit a target's constraints. (No
+  built-in rule produces this today, but `format` and `enforce` handle it
+  identically to the other two — it's part of the type for image-dimension
+  rules to grow into.)
+
+Use the `is*` guards or `Fidelity.$match` to branch on a finding's kind:
+
+```ts
+if (Fidelity.isDropped(finding)) { /* ... */ }
+
+Fidelity.$match(finding, {
+  Dropped: ({ feature, reason }) => `lost ${feature}: ${reason}`,
+  Approximated: ({ feature, approximation }) => `${feature} became ${approximation}`,
+  Resized: ({ feature }) => `${feature} was resized`
+})
+```
+
+## `Fidelity.format`
+
+Renders one `Finding` as a single readable line — this is what the `"warn"`
+policy logs:
+
+```ts
+Fidelity.format(
+  Fidelity.dropped({ target: "google", path: "relevance[0]", feature: "Beacon relevance", reason: "nope" })
+)
+// "[google] dropped Beacon relevance at relevance[0]: nope"
+
+Fidelity.format(
+  Fidelity.approximated({
+    target: "google", path: "assets.strip", feature: "Strip asset",
+    reason: "no distinct strip", approximation: "mapped to hero"
+  })
+)
+// "[google] approximated Strip asset at assets.strip: no distinct strip (mapped to hero)"
+```
+
+## `Fidelity.enforce` and `OnUnsupported`
+
+`enforce` takes a `ReadonlyArray<Finding>` (usually `report.apple` or
+`report.google`) and an `OnUnsupported` policy:
+
+```ts
+export type OnUnsupported = "ignore" | "warn" | "error"
+```
+
+- **`"ignore"`** — always succeeds, does nothing. You've decided this
+  target's lossiness is acceptable for your use case.
+- **`"warn"`** — logs one `Effect.logWarning` line per finding (via
+  `format`) and succeeds. Good default for development and for features
+  that are genuinely optional.
+- **`"error"`** — fails with `Fidelity.UnsupportedError` carrying every
+  finding, unless the list is empty. Use this where a dropped feature would
+  be a real regression — e.g. a beacon-relevance-driven pass where losing
+  that relevance on Google defeats the pass's purpose.
+
+```ts
+class UnsupportedError extends Data.TaggedError("FidelityUnsupportedError")<{
+  readonly findings: ReadonlyArray<Finding>
+}> {}
+```
+
+```ts
+const findings = Fidelity.audit(lossyPass).google
+const error = await Effect.runPromise(Effect.flip(Fidelity.enforce(findings, "error")))
+// error instanceof Fidelity.UnsupportedError, error.findings === findings
+```
+
+## Wired into the compilers
+
+`Apple.pkpass` and `Google.saveLink` both accept an `onUnsupported` option
+(default `"warn"`) and run `Fidelity.enforce(Fidelity.audit(validated)[target], options?.onUnsupported ?? "warn")`
+as part of the compile, after `Pass.validate`:
+
+```ts
+const pkpass = yield* Apple.pkpass(pass, { onUnsupported: "error" })
+// Effect<Apple.PkPass, ... | Fidelity.UnsupportedError, Apple.Signer>
+
+const saveLink = yield* Google.saveLink(pass, { onUnsupported: "ignore" })
+```
+
+Each target audits and enforces against its *own* half of the `Report` —
+`Apple.pkpass` never looks at `report.google` and vice versa. That's also
+why `Wallet.issue` (which runs both compilers concurrently) has no
+combined-fidelity option: pass `onUnsupported` to `Apple.pkpass`/
+`Google.saveLink` directly when you need per-target policy, per the note in
+[Getting started](/docs).
+
+## Snapshot the audit in CI
+
+Because `audit` is pure and deterministic, it's cheap to pin as a test
+fixture — catch a regression the moment a compiler's mapping (or your
+template's `render`) changes what gets dropped, without needing real
+certificates or a live wallet call:
+
+```ts
+import { expect, test } from "bun:test"
+
+test("EffectDays template has no google fidelity loss", () => {
+  const pass = /* Template.issue(...) or a fixture Pass */ lossyPass
+  expect(Fidelity.audit(pass).google).toEqual([])
+})
+```
+
+If that snapshot starts failing, it's telling you the truth about the
+target, not a false positive — either the pass genuinely lost something new
+or the fixture needs updating on purpose. Either way it's a decision you
+make deliberately, in a diff, rather than a wallet install silently missing
+a beacon trigger in production.
+
+## See also
+
+- [`Pass`](/docs/Pass) — the IR being audited; `Pass.validate` runs before
+  `Fidelity.audit` in every compile entrypoint.
+- [`Template`](/docs/Template) — audit a template's rendered output at
+  design time, before it ever reaches a compiler.
+- `DESIGN.md` §6 in the repo — the full fidelity model and why lossiness is
+  modeled as data rather than swallowed or thrown.

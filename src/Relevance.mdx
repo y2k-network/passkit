@@ -1,0 +1,110 @@
+---
+title: Relevance
+description: Where and when a pass surfaces — location, time window, and Apple-only beacon regions.
+---
+
+A pass sitting in a wallet is inert until the OS decides to surface it on
+the lock screen. `Relevance` is how you tell it when: near a place, during a
+window, or (Apple only) near an iBeacon region.
+
+## Constructors
+
+```ts
+import { describe, expect, test } from "bun:test"
+import * as DateTime from "effect/DateTime"
+import { Relevance } from "@y2k-network/passkit"
+
+describe("Relevance", () => {
+  test("near/during/beacon constructors", () => {
+    const near = Relevance.near({ lat: 52.52, lng: 13.405, note: "Walk to Gate B42" })
+    expect(Relevance.isNear(near)).toBe(true)
+
+    const during = Relevance.during({
+      start: DateTime.makeUnsafe("2026-01-01T19:00:00Z"),
+      end: DateTime.makeUnsafe("2026-01-01T23:00:00Z")
+    })
+    expect(Relevance.isDuring(during)).toBe(true)
+
+    const beacon = Relevance.beacon({ proximityUUID: "uuid", major: 1, minor: 2 })
+    expect(Relevance.isBeacon(beacon)).toBe(true)
+  })
+})
+```
+
+`Relevance` is a `Data.TaggedEnum` — `Near`, `During`, `Beacon` — with
+`isNear`/`isDuring`/`isBeacon` guards and `Relevance.$match`. Attach one or
+more to a pass with [`Pass.relevant`](/docs/Pass):
+
+```ts
+import { Pass } from "@y2k-network/passkit"
+
+ticket.pipe(
+  Pass.relevant(
+    Relevance.near({ lat: 52.52, lng: 13.405, note: "Walk to Gate B42" }),
+    Relevance.during({ start: doors, end: ends })
+  )
+)
+```
+
+`Pass.relevant` is variadic and additive (`dual`-style, like every `Pass`
+combinator) — call it more than once and the arrays concatenate rather than
+replace.
+
+## `Near` — location
+
+```ts
+Relevance.near({ lat: 52.52, lng: 13.405, note: "Walk to Gate B42" })
+```
+
+Both platforms surface passes near a geo-coordinate: Apple via the pass's
+`locations` array on the lock screen, Google via the Wallet app's location
+awareness. `note` is optional context for the surfaced notification (Apple's
+`relevantText`-adjacent copy).
+
+## `During` — time window
+
+```ts
+Relevance.during({ start: doors, end: ends })
+```
+
+`start`/`end` are real `DateTime.DateTime` values, not strings — consistent
+with `Field.date`'s "typed value, target formats it" philosophy elsewhere in
+the IR. Both platforms use a relevant date/window to decide when a pass is
+worth surfacing without the user opening the wallet app.
+
+## `Beacon` — Apple only
+
+```ts
+Relevance.beacon({ proximityUUID: "uuid", major: 1, minor: 2, note: "At the gate" })
+```
+
+iBeacon regions are an Apple-only surfacing mechanism — Google Wallet has no
+equivalent concept. `Relevance.beacon(...)` still type-checks and compiles
+fine on `Apple.pkpass`; on `Google.saveLink` it's silently unrepresentable,
+which is exactly the case [`Fidelity`](/docs/Fidelity) exists for: it shows
+up as a `Fidelity.Dropped` finding in `Fidelity.audit(pass).google`, and
+`{ onUnsupported: "error" }` will fail the compile instead of shipping a
+pass that quietly lost its beacon trigger.
+
+```ts
+Google.saveLink(pass, { onUnsupported: "error" }) // fails with Fidelity.UnsupportedError if a Beacon is present
+```
+
+If beacon proximity matters to your integration, budget for the fact that
+it's an Apple-exclusive feature — there's no Google fallback to approximate
+it with, only the choice of dropping it (default, with a warning) or
+refusing to compile.
+
+## Serialization
+
+`RelevanceSchema` is a `Schema.Union` of `NearSchema`/`DuringSchema`/
+`BeaconSchema`, each a `Schema.TaggedStruct` mirroring the runtime variant —
+same pattern as `Asset`/`Barcode`/`Field`. `During`'s `start`/`end` encode
+via `Schema.DateTimeUtcFromString`, so a round trip through `Pass.Schema`
+gives you back real `DateTime` values, not raw strings.
+
+## See also
+
+- [`Pass`](/docs/Pass) — `Pass.relevant`, the combinator that attaches `Relevance` values.
+- [`Fidelity`](/docs/Fidelity) — how `Relevance.Beacon` (and other Apple-only data) is reported as dropped on Google, and the `onUnsupported` policy.
+- [`Apple`](/docs/Apple) — where `locations`/beacon regions land in the compiled `.pkpass`.

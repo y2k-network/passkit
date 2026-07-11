@@ -1,0 +1,101 @@
+---
+title: Color
+description: Branded, validated #rrggbb hex color for pass backgrounds, foregrounds, and labels.
+---
+
+`Color` is a branded `#rrggbb` hex string — small on purpose. It exists so a
+raw `string` can't sneak into `pass.colors` unvalidated, and so `Pass`,
+`Apple`, and `Google` all agree on exactly one color representation.
+
+## Constructing a `Color`
+
+```ts
+import { describe, expect, test } from "bun:test"
+import { Color } from "@y2k-network/passkit"
+
+test("hex validates and brands", () => {
+  const c = Color.hex("#1e1b4b")
+  expect(String(c)).toBe("#1e1b4b")
+})
+
+test("hex rejects invalid strings", () => {
+  expect(() => Color.hex("blue")).toThrow()
+  expect(() => Color.hex("#fff")).toThrow()
+})
+
+test("rgb builds a hex color", () => {
+  expect(String(Color.rgb(30, 27, 75))).toBe("#1e1b4b")
+  expect(String(Color.rgb(255, 255, 255))).toBe("#ffffff")
+})
+```
+
+`Color.hex` decodes and brands a `#rrggbb` string, throwing synchronously if
+it isn't a valid 6-digit hex color — named colors (`"blue"`) and shorthand
+(`"#fff"`) are both rejected; both targets' wire formats want six digits.
+`Color.rgb` is a convenience constructor from three 0-255 components,
+clamped and truncated before being formatted through `Color.hex`.
+
+## Where colors land per platform
+
+Attach colors to a pass with [`Pass.colors`](/docs/Pass):
+
+```ts
+import { Pass } from "@y2k-network/passkit"
+
+const p = Pass.eventTicket({ serial: Pass.Serial("TKT-1"), description: "Effect Days" }).pipe(
+  Pass.colors({
+    background: Color.hex("#1e1b4b"),
+    foreground: Color.hex("#ffffff"),
+    label: Color.hex("#a5b4fc")
+  })
+)
+```
+
+`Pass.Colors` has three optional slots — but the two targets don't have
+matching surface for all three:
+
+<AutoTypeTable path="../src/Pass.ts" name="Colors" />
+
+- **Apple** uses all three: `backgroundColor`, `foregroundColor`, and
+  `labelColor` in `pass.json`, each an `rgb(r, g, b)` string Apple derives
+  from the hex value at compile time.
+- **Google** only has `hexBackgroundColor` on the Wallet object —
+  `background` maps straight across. There is no foreground-color field
+  (Google always computes a readable foreground itself) and, more
+  importantly, **no `labelColor` equivalent at all**.
+
+That last gap isn't silently absorbed — it's a recorded
+[Fidelity](/docs/Fidelity) finding. `label` colors dropped when compiling to
+Google surface as a `Dropped` finding from `Fidelity.audit`, with
+`reason: "Google Wallet has no labelColor equivalent"`, and are subject to
+whatever `onUnsupported` policy you pass to `Google.saveLink`/`Google.sync`
+(`"warn"` by default — see [Fidelity](/docs/Fidelity) for the full
+audit/enforce model). Set `label` when you care about Apple's presentation;
+just know it's a no-op, not silently-ignored data loss, on the Google side.
+
+## Wire encoding
+
+`Color.ColorSchema` is the schema behind `Color` — branded, validated, and
+directly `Schema.encodeSync`/`Schema.decodeUnknownSync`-compatible since a
+`Color` is just a checked string, no `Data.taggedEnum` indirection needed:
+
+```ts
+import * as Schema from "effect/Schema"
+
+test("schema round-trips", () => {
+  const encoded = Schema.encodeSync(Color.ColorSchema)(Color.hex("#a5b4fc"))
+  const decoded = Schema.decodeUnknownSync(Color.ColorSchema)(encoded)
+  expect(String(decoded)).toBe("#a5b4fc")
+})
+```
+
+`Pass.Schema` composes `ColorsSchema` (three optional `ColorSchema` fields)
+the same way it composes `Field`, `Barcode`, and `Asset` — see
+[Pass — Serialization](/docs/Pass#serialization).
+
+## See also
+
+- [Pass](/docs/Pass) — `Pass.colors` attaches background/foreground/label to
+  a pass.
+- [Fidelity](/docs/Fidelity) — the `labelColor` drop on Google, and every
+  other target-specific gap, recorded as data.

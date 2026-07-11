@@ -1,0 +1,151 @@
+---
+title: Template
+description: The Class/Object split made universal — data in, a validated Pass out.
+---
+
+Google Wallet natively splits a pass into a **Class** (shared layout/branding,
+issued once) and an **Object** (per-holder data, issued many times). Apple
+Wallet has no such split — every `.pkpass` is self-contained. `Template`
+takes Google's better idea and makes it the universal shape: a `Schema` for
+per-holder data, plus a pure function from that decoded data to a `Pass`.
+`Template` ≍ Class, `Pass` ≍ Object — even when the target is Apple, which
+never sees the distinction.
+
+The payoff isn't cosmetic. Centralizing layout in one `render` function
+means the layout is testable, composable (it's just a `Pass -> Pass`
+function you can factor out and reuse across templates), and — because it's
+gated behind a `Schema` — the one place bad holder data gets caught before
+it becomes a malformed pass.
+
+## `Template.make`
+
+```ts
+import { Schema } from "effect"
+import { Barcode, Field, Pass, Template } from "@y2k-network/passkit"
+
+class Attendee extends Schema.Class<Attendee>("Attendee")({
+  name: Schema.NonEmptyString,
+  ticketId: Schema.String,
+  tier: Schema.Literals(["ga", "vip"])
+}) {}
+
+const EffectDays = Template.make({
+  id: Template.Id("effect-days-2026"),
+  data: Attendee,
+  render: (a) =>
+    Pass.eventTicket({
+      serial: Pass.Serial(a.ticketId),
+      description: `Effect Days 2026 — ${a.tier === "vip" ? "VIP" : "GA"}`
+    }).pipe(
+      Pass.primary(Field.text({ key: "name", label: "ATTENDEE", value: a.name })),
+      Pass.barcode(Barcode.Qr({ content: a.ticketId }))
+    )
+})
+```
+
+`Template.Id` brands a plain string (`Schema.brand("TemplateId")`), thrown
+synchronously if empty — it's an identity you set once at definition time,
+not something that needs an `Effect` to construct.
+
+`render` is not special API surface — it's just a function `A -> Pass`,
+which means it composes like any other function. Share branding across
+templates by extracting a `Pass -> Pass` step and piping it into each
+`render`:
+
+```ts
+const sharedBranding = Pass.colors({ background: Color.hex("#1e1b4b") })
+// render: (a) => Pass.eventTicket({ ... }).pipe(..., sharedBranding)
+```
+
+## `Template.issue` / `Template.issueAll`
+
+Issuing is three steps, always in this order: **decode -> render ->
+validate**.
+
+```ts
+import * as Effect from "effect/Effect"
+
+const pass = yield* Template.issue(EffectDays, { name: "Ada Lovelace", ticketId: "TKT-0001", tier: "vip" })
+// pass._tag === "EventTicket", pass.slots.primary[0] is the ATTENDEE field
+```
+
+1. `Schema.decodeUnknownEffect(template.data)(input)` — your holder data
+   might come from a webhook body, a CSV row, a queue message; it's
+   `unknown` until the schema says otherwise.
+2. `template.render(decoded)` — pure, can't fail.
+3. `Pass.validate` — the same slot-arity/duplicate-key check every compile
+   entrypoint runs (see [`Pass`](/docs/Pass)). A `Template` that always
+   renders correctly-shaped passes will never trip this; catching it here
+   still means you find out before the pass reaches a wallet target instead
+   of after.
+
+`issueAll` runs `issue` over an `Iterable`, failing fast on the first bad
+input and returning `Array<Pass>`:
+
+```ts
+const passes = yield* Template.issueAll(EffectDays, [
+  { name: "Ada Lovelace", ticketId: "TKT-1", tier: "vip" },
+  { name: "Alan Turing", ticketId: "TKT-2", tier: "ga" }
+])
+```
+
+## `Template.IssueError`
+
+A decode failure doesn't surface as a raw `ParseError` — it's wrapped with
+the template's `id` so a batch failure across many templates is legible at a
+glance:
+
+```ts
+const exit = await Effect.runPromiseExit(
+  Template.issue(EffectDays, { name: "", ticketId: "TKT-0002", tier: "vip" })
+)
+// exit is a Failure; the error is:
+//   { _tag: "TemplateIssueError", templateId: "effect-days-2026", message: "Template \"effect-days-2026\" failed to decode input: ..." }
+```
+
+`Template.issue`'s error channel is `IssueError | Pass.ValidationError` — a
+render bug that produces duplicate field keys surfaces as
+`Pass.ValidationError` (`_tag: "PassValidationError"`), not silently wrapped
+into `IssueError`, so you can tell "your input was bad" apart from "your
+template is bad":
+
+```ts
+const Dup = Template.make({
+  id: Template.Id("dup-template"),
+  data: Attendee,
+  render: (a) =>
+    Pass.eventTicket({ serial: Pass.Serial(a.ticketId), description: "Duplicate keys" }).pipe(
+      Pass.primary(Field.text({ key: "name", label: "A", value: a.name })),
+      Pass.secondary(Field.text({ key: "name", label: "B", value: a.name })) // same key twice
+    )
+})
+
+const exit = await Effect.runPromiseExit(Template.issue(Dup, { name: "Ada", ticketId: "TKT-0003", tier: "ga" }))
+// Failure: Pass.ValidationError { reason: "DuplicateKey" }
+```
+
+## Type reference
+
+<AutoTypeTable path="../src/Template.ts" name="Template" />
+
+## What `Template` is not (yet)
+
+`Template` is a per-holder-data factory only — the Class/Object split is
+conceptual, not mechanical. There is no `Template.sync` that upserts a
+Google Wallet *class* from a `Template` definition the way `Google.sync`
+upserts a class/object pair from a fully-rendered `Pass`. Today, syncing a
+class to Google means calling `Google.sync` per issued `Pass`, which
+re-upserts the class every time (redundant, not wrong). This is on the
+roadmap — see `DESIGN.md`'s Roadmap section — but not shipped. Don't build
+around a `Template.sync` that doesn't exist.
+
+## See also
+
+- [`Pass`](/docs/Pass) — the IR `render` produces, and the validation rules
+  `Template.issue` enforces.
+- [`Fidelity`](/docs/Fidelity) — audit the `Pass` a template renders before
+  compiling it to a target; `Apple.pkpass`/`Google.saveLink` run this audit
+  automatically, but you can call `Fidelity.audit` directly on a template's
+  output to catch lossiness at design time.
+- [Getting started](/docs) — `Template.make` + `Template.issue` in the full
+  one-pass-two-wallets example.

@@ -1,0 +1,24 @@
+{
+  "title": "@y2k-network/passkit",
+  "pages": [
+    "index",
+    "---IR---",
+    "Pass",
+    "Field",
+    "Barcode",
+    "Color",
+    "Asset",
+    "Relevance",
+    "Semantics",
+    "Template",
+    "Fidelity",
+    "---Targets---",
+    "Apple",
+    "Google",
+    "Wallet",
+    "---Lifecycle---",
+    "AppleWebService",
+    "Registry",
+    "..."
+  ]
+}

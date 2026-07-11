@@ -26,5 +26,9 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  // docs/ is a standalone Next.js app with its own tsconfig.json — without this
+  // exclude, `tsc --noEmit` here (no explicit include) implicitly sweeps it up
+  // too, since it has no include/exclude of its own.
+  "exclude": ["docs", "node_modules"]
 }

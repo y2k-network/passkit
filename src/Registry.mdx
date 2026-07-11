@@ -1,0 +1,94 @@
+---
+title: Registry
+description: Storage for Apple device registrations — the bookkeeping behind the web-service update protocol.
+---
+
+Apple's push-update model isn't "the server pushes new pass data" — it's
+"the server pushes a wake-up, the device asks for what changed." Making that
+work requires storing, per pass, which devices are registered for it and a
+push token to wake each one. `Registry` is that storage, factored out as a
+service so [`AppleWebService`](/docs/AppleWebService) doesn't hardcode a
+database.
+
+## The service
+
+```ts
+export interface RegistryShape {
+  readonly register: (args: RegistrationKey) => Effect.Effect<void, RegistryError>
+  readonly unregister: (
+    args: { deviceLibraryId: string; passTypeId: string; serial: string }
+  ) => Effect.Effect<void, RegistryError>
+  readonly serialsForDevice: (
+    args: { deviceLibraryId: string; passTypeId: string; updatedSince?: number }
+  ) => Effect.Effect<SerialsForDevice, RegistryError>
+  readonly markUpdated: (serial: string) => Effect.Effect<void, RegistryError>
+}
+```
+
+`register`/`unregister` back the device-registration endpoints directly.
+`serialsForDevice` answers the `passesUpdatedSince` polling query — this is
+device-keyed on purpose (it's what a device asks), not serial-keyed, which
+is why fanning out a push to "every device registered for this serial" is
+left to the caller (see [`AppleWebService.updated`](/docs/AppleWebService#updated)).
+`markUpdated` bumps a serial's timestamp so the next poll picks it up.
+
+<AutoTypeTable path="../src/Registry.ts" name="RegistrationKey" />
+
+<AutoTypeTable path="../src/Registry.ts" name="SerialsForDevice" />
+
+## `layerMemory`
+
+An in-process, `Ref`-backed implementation, timestamped via `Clock` (so it's
+testable with `TestClock`, not wall-clock `Date.now()`). Fine for dev and
+tests; registrations don't survive a restart.
+
+```ts
+import * as Effect from "effect/Effect"
+import { Registry } from "@y2k-network/passkit"
+
+const program = Effect.gen(function*() {
+  const registry = yield* Registry.Registry
+  yield* registry.register({
+    deviceLibraryId: "D",
+    pushToken: "T",
+    passTypeId: "pass.com.acme.tickets",
+    serial: "TICKET-001"
+  })
+  const before = yield* registry.serialsForDevice({
+    deviceLibraryId: "D",
+    passTypeId: "pass.com.acme.tickets"
+  })
+  yield* registry.markUpdated("TICKET-001")
+  const after = yield* registry.serialsForDevice({
+    deviceLibraryId: "D",
+    passTypeId: "pass.com.acme.tickets",
+    updatedSince: before.lastUpdated
+  })
+  return { before, after }
+})
+
+const result = await Effect.runPromise(program.pipe(Effect.provide(Registry.layerMemory)))
+```
+
+## Production
+
+There is no `layerSql` yet — bring your own by providing `Registry` with
+the same shape, backed by whatever you already run (Postgres, SQLite via
+`bun:sqlite`, DynamoDB). The contract to preserve:
+
+- `register` is idempotent — re-registering the same device/pass/token pair
+  is a no-op, not a duplicate row.
+- `serialsForDevice`'s `updatedSince` filter is strict (`>`, not `>=`) —
+  a device polling with the tag it was just given should see nothing new
+  until the next `markUpdated`.
+- `lastUpdated` in the response is the max timestamp across the *returned*
+  serials, not a global clock — it's the tag the device echoes back on its
+  next poll.
+
+A SQL-backed `Registry` is on the roadmap (DESIGN.md); until then this is
+the one piece of `@y2k-network/passkit` you're expected to supply yourself
+for production Apple push support.
+
+## See also
+
+- [`AppleWebService`](/docs/AppleWebService) — the HttpApi group that reads and writes through `Registry`.

@@ -1,0 +1,189 @@
+---
+title: AppleWebService
+description: The Apple Wallet web-service update protocol, as a mountable HttpApi group.
+---
+
+Apple passes don't push updates directly — a device holding a pass with a
+`webServiceURL` and `authenticationToken` registers with your server, your
+server later tells the device (via a silent APNs push) that *something*
+changed, and the device re-polls your server to find out what. `AppleWebService`
+is that server side, implemented once as an `effect/unstable/httpapi`
+`HttpApiGroup` you mount into your own `HttpApi`.
+
+This only matters if you set `webService` when compiling a pass — see
+[`Apple.pkpass`](/docs/Apple)'s `webService` option, which is also what
+`Wallet.issue`'s `apple.webService` forwards to (see [`Wallet`](/docs/Wallet)).
+Without it, the pass has no update channel and none of this applies.
+
+## The five endpoints
+
+```
+POST   /v1/devices/{deviceLibraryIdentifier}/registrations/{passTypeIdentifier}/{serialNumber}
+DELETE /v1/devices/{deviceLibraryIdentifier}/registrations/{passTypeIdentifier}/{serialNumber}
+GET    /v1/devices/{deviceLibraryIdentifier}/registrations/{passTypeIdentifier}?passesUpdatedSince=...
+GET    /v1/passes/{passTypeIdentifier}/{serialNumber}
+POST   /v1/log
+```
+
+These are exactly Apple's spec — register a device, unregister it, list the
+serials updated since a given tag, fetch the latest `.pkpass` bytes for a
+serial, and accept device-side error logs. You don't write handlers for
+them; `AppleWebService.layer` implements all five against two services you
+provide: [`Registry`](/docs/Registry) for the device-registration
+bookkeeping, and `PassProvider` for authorization + rendering.
+
+## `PassProvider`
+
+The bridge from the protocol to your app's actual pass data:
+
+```ts
+export interface PassProviderShape {
+  readonly authorize: (
+    args: { passTypeId: string; serial: string; authToken: string }
+  ) => Effect.Effect<boolean>
+
+  readonly passFor: (
+    args: { passTypeId: string; serial: string }
+  ) => Effect.Effect<Apple.PkPass, PassNotFoundError>
+}
+```
+
+`authorize` checks the bearer token from the `Authorization: ApplePass
+<token>` header against what you issued the pass with — return `false` (not
+a failure) for a bad token; the endpoint turns that into a `401` itself.
+`passFor` re-renders the current `.pkpass` bytes for a serial — this is
+where you'd re-run [`Apple.pkpass`](/docs/Apple) against the pass's latest
+data.
+
+From `test/AppleWebService.test.ts`:
+
+```ts
+const stubProvider: AppleWebService.PassProviderShape = {
+  authorize: ({ authToken }) => Effect.succeed(authToken === AUTH_TOKEN),
+  passFor: ({ passTypeId, serial }) =>
+    passTypeId === PASS_TYPE_ID && serial === SERIAL
+      ? Effect.succeed({ bytes: PASS_BYTES, contentType: "application/vnd.apple.pkpass" as const })
+      : Effect.fail(new AppleWebService.PassNotFoundError({ passTypeId, serial }))
+}
+```
+
+## Mounting and serving
+
+Mount `AppleWebService.group` into your own `HttpApi`, or use the
+standalone `AppleWebService.Api` this module ships (an `HttpApi` with just
+this group added — what `AppleWebService.layer` is wired against). Serve it
+with `HttpRouter.toWebHandler` and `Bun.serve` — the real pattern from the
+test suite:
+
+```ts
+import * as Layer from "effect/Layer"
+import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder"
+import * as HttpRouter from "effect/unstable/http/HttpRouter"
+import * as HttpServer from "effect/unstable/http/HttpServer"
+
+import { AppleWebService, Registry } from "@y2k-network/passkit"
+
+const { dispose, handler } = HttpRouter.toWebHandler(
+  HttpApiBuilder.layer(AppleWebService.Api).pipe(
+    Layer.provide(AppleWebService.layer),
+    Layer.provide(AppleWebService.PassProvider.layer(stubProvider)),
+    Layer.provide(Registry.layerMemory),
+    Layer.provide(HttpServer.layerServices)
+  )
+)
+
+const server = Bun.serve({ port: 0, fetch: (request) => handler(request) })
+```
+
+Swap `Registry.layerMemory` for your own `Registry` implementation in
+production (see [`Registry`](/docs/Registry)) — nothing else in this wiring
+changes.
+
+## `Pusher`
+
+The half of the protocol that lives outside HTTP entirely: telling a device
+to come poll you, via a silent APNs push (empty payload — the device
+doesn't need content, just a nudge).
+
+```ts
+export interface PusherShape {
+  readonly notify: (pushToken: string) => Effect.Effect<void>
+}
+```
+
+Real APNs delivery — HTTP/2, token or cert auth, the `passTypeId` topic — is
+**roadmap, not implemented**. `Pusher.layerNoop` is today's default: it
+accepts the interface and does nothing. Wire up a real implementation
+(against `node:http2` or any APNs client) and provide it in place of
+`layerNoop` when you're ready to actually push; until then, devices still
+get updates, just via their own periodic background poll rather than an
+immediate nudge.
+
+```ts
+export const layerNoop: Layer.Layer<Pusher> = Layer.succeed(Pusher, {
+  notify: () => Effect.void
+})
+```
+
+## `updated`
+
+The helper you call from your own app code (order fulfillment, a gate
+change, a balance update) when a pass's data changes — not part of the
+`HttpApi` group itself:
+
+```ts
+export const updated = (
+  serial: string,
+  pushTokens?: ReadonlyArray<string>
+): Effect.Effect<void, Registry.RegistryError, Registry.Registry | Pusher> =>
+  Effect.gen(function*() {
+    const registry = yield* Registry.Registry
+    yield* registry.markUpdated(serial)
+
+    if (pushTokens !== undefined && pushTokens.length > 0) {
+      const pusher = yield* Pusher
+      yield* Effect.forEach(pushTokens, (token) => pusher.notify(token), { discard: true })
+    }
+  })
+```
+
+It marks the serial updated (so the next `passesUpdatedSince` poll surfaces
+it even under `layerNoop`) and, if you pass push tokens, fans a push out to
+each. `Registry`'s public shape is device-keyed, not serial-keyed by design
+(see [`Registry`](/docs/Registry)) — looking up which push tokens are
+registered for a given serial is on you, typically via your own index or by
+scanning your `Registry`'s storage directly for small deployments.
+
+## Auth and status codes
+
+Every endpoint except `/v1/log` requires `Authorization: ApplePass
+<authToken>`; a missing or unauthorized token is a `401`, checked against
+`PassProvider.authorize` before touching `Registry`. Beyond that, the module
+follows Apple's spec exactly: `201` on register, `200` on unregister/pass
+fetch/log, `204` on an empty (or filtered-to-empty) list rather than an
+empty JSON array, `404` when `PassProvider.passFor` can't find the pass.
+
+```ts
+test("204s on an empty list", async () => {
+  const res = await fetch(
+    `${baseUrl}/v1/devices/UNKNOWN-DEVICE/registrations/${PASS_TYPE_ID}`,
+    { headers: { authorization: `ApplePass ${AUTH_TOKEN}` } }
+  )
+  expect(res.status).toBe(204)
+})
+```
+
+## Errors
+
+`PassNotFoundError` (`_tag: "ApplePassNotFoundError"`) is the only error
+type this module introduces — raised from `PassProvider.passFor` and turned
+into a `404` by the `pass` handler. `Registry`'s own `RegistryError`
+propagates through `register`/`unregister`/`serialsForDevice`/`markUpdated`
+as-is; the group's `layer` requires both `Registry.Registry` and
+`PassProvider` in `R`.
+
+## See also
+
+- [`Registry`](/docs/Registry) — the device-registration storage this module reads and writes.
+- [`Apple`](/docs/Apple) — `webService` option on `Apple.pkpass`, and the `PkPass` shape `passFor` returns.
+- [`Wallet`](/docs/Wallet) — `apple.webService` passthrough on `Wallet.issue`.

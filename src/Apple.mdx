@@ -1,0 +1,241 @@
+---
+title: Apple
+description: The Apple Wallet compile target — Signer service, cert expiry fail-fast, and Pass -> signed .pkpass.
+---
+
+`Apple` is one of the two compile targets off the neutral [`Pass`](/docs/Pass)
+IR (DESIGN.md §5.1). `Apple.pkpass` turns a validated `Pass` into a signed
+`.pkpass` bundle — a zip of `pass.json`, image assets, a SHA-1 manifest, and
+a detached CMS/PKCS#7 signature. Everything platform-specific (the signing
+identity, Apple's WWDR intermediate, the zip/manifest/CMS mechanics) lives
+behind the `Signer` service, so the pass definition itself never touches
+Apple's plumbing.
+
+## `Signer` — the signing identity as a service
+
+```ts
+export interface SignerShape {
+  readonly identity: CertificateInternal.SigningIdentity
+  readonly wwdr: forge.pki.Certificate
+  readonly teamId: string
+  readonly passTypeId: string
+}
+```
+
+You never construct a `SignerShape` by hand — build the layer with
+`Apple.layer` (real signing) or use `Apple.layerUnsigned` (structurally
+complete but unsigned, for tests/CI).
+
+### `Apple.layer`
+
+```ts
+import { Apple } from "@y2k-network/passkit"
+
+const signerLayer = Apple.layer({
+  teamId: "TEAM123456",
+  passTypeId: "pass.com.acme.tickets",
+  certificate: Apple.Certificate.pem({ cert: chain.leafPem, key: chain.leafKeyPem }),
+  wwdr: chain.wwdrPem
+})
+```
+
+<AutoTypeTable path="../src/Apple.ts" name="LayerConfig" />
+
+`certificate` takes one of two forms, both produced by the `Apple.Certificate`
+constructors:
+
+```ts
+// The form Apple's developer portal exports — a .p12 archive + its password.
+Apple.Certificate.pkcs12({
+  bytes: p12Bytes,      // Uint8Array — read the .p12 yourself, e.g. Bun.file(path).arrayBuffer()
+  password: "..."       // string or Redacted.Redacted<string>
+})
+
+// A PEM certificate + PEM private key pair, e.g. after `openssl pkcs12 -export`
+// round-trips or a Keychain export.
+Apple.Certificate.pem({
+  cert: leafPem,
+  key: leafKeyPem,
+  passphrase: "..."     // required only if `key` is encrypted (PKCS#8 "ENCRYPTED
+                         // PRIVATE KEY" or legacy encrypted PEM); string or Redacted
+})
+```
+
+`pkcs12`'s `password` and `pem`'s `passphrase` accept either a plain string or
+an `effect/Redacted` value — pass a `Redacted.Redacted<string>` if you're
+already carrying the secret that way (e.g. pulled from a secrets manager) and
+it's used as-is; a plain string gets wrapped in `Redacted.make` for you.
+
+### `wwdr` is required — on purpose
+
+```ts
+export interface LayerConfig {
+  readonly teamId: string
+  readonly passTypeId: string
+  readonly certificate: CertificateConfig
+  readonly wwdr: string
+}
+```
+
+Apple's WWDR (Worldwide Developer Relations) intermediate certificate has to
+chain your leaf certificate up to Apple's root for a wallet to trust the
+signature. This library does not bundle it. Not an oversight — verifying an
+exact, byte-correct, currently-valid copy offline isn't something a library
+can do reliably, and a stale or wrong embedded cert would silently produce
+passes that fail to install. Apple also rotates WWDR intermediates (G1..G4
+and beyond) on its own schedule, so a hardcoded constant would eventually go
+stale regardless. Fetch the current PEM from
+[apple.com/certificateauthority](https://www.apple.com/certificateauthority/)
+yourself, verify its fingerprint, and pass its bytes as `wwdr` — this is a
+supply-chain call the library declines to make for you.
+
+### Cert expiry fails the layer, not the request
+
+```ts
+export class CertificateExpiredError extends Data.TaggedError("AppleCertificateExpiredError")<{
+  readonly notAfter: Date
+  readonly message: string
+}> {}
+```
+
+`Apple.layer` checks `identity.notAfter` against the clock **at layer
+construction** — an expired signing cert fails your deploy loudly at
+startup, not your user's add-to-wallet tap in production three weeks later:
+
+```ts
+test("Apple.layer fails when the signing certificate has already expired", async () => {
+  const signerLayer = Apple.layer({
+    teamId: "TEAM123456",
+    passTypeId: "pass.com.acme.expired",
+    certificate: Apple.Certificate.pem({ cert: expiredCertPem, key: expiredKeyPem }),
+    wwdr: chain.wwdrPem
+  })
+
+  const pass = Pass.generic({ serial: Pass.Serial("EXP-1"), description: "Generic" })
+  const exit = await Effect.runPromiseExit(Apple.pkpass(pass).pipe(Effect.provide(signerLayer)))
+  expect(exit._tag).toBe("Failure") // CertificateExpiredError, surfaced at layer build
+})
+```
+
+### `Apple.layerUnsigned` — tests/CI only
+
+```ts
+test("layerUnsigned produces a structurally complete but unsigned bundle", async () => {
+  const pass = Pass.generic({ serial: Pass.Serial("NOOP-1"), description: "Generic" })
+
+  const pkpass = await Effect.runPromise(Apple.pkpass(pass).pipe(Effect.provide(Apple.layerUnsigned)))
+  const unzipped = unzipSync(pkpass.bytes)
+  expect(unzipped["signature"]!.length).toBe(0)
+  expect(unzipped["pass.json"]).toBeDefined()
+  expect(unzipped["manifest.json"]).toBeDefined()
+})
+```
+
+`Apple.layerUnsigned` builds a real zip with a real manifest, but
+`signature` is empty bytes — no identity, no WWDR, nothing to verify against.
+Use it to exercise your integration end-to-end without provisioning
+certificates. No wallet installs a pass with an invalid signature, so never
+ship this to production. (`Apple.layerNoop` is a deprecated alias, kept for
+backward compatibility.)
+
+## `Apple.pkpass` — the compile
+
+```ts
+import { Apple } from "@y2k-network/passkit"
+
+const pkpass = await Effect.runPromise(
+  Apple.pkpass(pass).pipe(Effect.provide(signerLayer))
+)
+// Effect<Apple.PkPass, Apple.PkpassError, Apple.Signer>
+
+pkpass.bytes        // Uint8Array — the signed zip, ready to write or serve
+pkpass.contentType  // "application/vnd.apple.pkpass" (literal type)
+```
+
+The pipeline, in order, mirrors `Apple.pkpass`'s own implementation:
+
+1. **`Pass.validate`** — slot arity, key uniqueness, kind-specific
+   requirements. Every compile entrypoint runs this first (DESIGN.md §3.1);
+   nothing malformed reaches the rest of the compiler.
+2. **`Fidelity.enforce`** — `Fidelity.audit(validated).apple` findings are
+   applied against `options.onUnsupported` (default `"warn"`: logged via
+   `Effect.logWarning`, compile still proceeds). See [`Fidelity`](/docs/Fidelity).
+3. **Resolve assets** — every set `Asset` (icon/logo/strip/hero/thumbnail, at
+   1x/2x/3x) is read to `Uint8Array`: `Asset.bytes` is free, `Asset.file`
+   reads via `Bun.file`, `Asset.url` is `fetch`ed. `hero` maps onto
+   `strip.png` when there's no dedicated `strip` asset; if both are set,
+   `strip` wins.
+4. **Compile `pass.json`** — the IR plus `teamId`/`passTypeId` from the
+   `Signer` and the optional `webService` block.
+5. **Manifest** — SHA-1 of every file (`pass.json` + assets).
+6. **Sign** — detached CMS/PKCS#7 over the manifest, via `node-forge`, using
+   the `Signer`'s leaf identity and WWDR intermediate. (Skipped —
+   empty-bytes signature — under `layerUnsigned`.)
+7. **Zip** — `pass.json` + assets + `manifest.json` + `signature`, into the
+   final bundle.
+
+<AutoTypeTable path="../src/Apple.ts" name="PkpassOptions" />
+
+```ts
+const pkpass = await Effect.runPromise(
+  Apple.pkpass(pass, {
+    webService: { url: "https://updates.acme.com", authToken: "..." },
+    onUnsupported: "error" // fail hard on any Fidelity.Dropped/Approximated/Resized finding
+  }).pipe(Effect.provide(signerLayer))
+)
+```
+
+Set `webService` when the pass should support Apple's device-registration /
+push-update protocol later — see [`AppleWebService`](/docs/AppleWebService)
+and [`Registry`](/docs/Registry) for the receiving side.
+
+## `PkPass` — the artifact
+
+```ts
+export interface PkPass {
+  readonly bytes: Uint8Array
+  readonly contentType: "application/vnd.apple.pkpass"
+}
+```
+
+Plain data, nothing HTTP-shaped — write `bytes` to a file, or set it as a
+response body with `contentType` as the `Content-Type` header. No
+`Response` object is constructed for you; that decision (framework, headers,
+caching) is yours.
+
+## Error taxonomy
+
+```ts
+export type PkpassError =
+  | Pass.ValidationError
+  | Apple.AssetResolveError
+  | Apple.SigningError
+  | Fidelity.UnsupportedError
+```
+
+Plus errors raised at `Apple.layer` construction, which show up in `R`'s
+error channel for the layer itself, not in `PkpassError`:
+
+| Error | Raised by | Meaning |
+| --- | --- | --- |
+| `Apple.CertificateError` | `Apple.layer` | signing identity failed to load/parse (bad p12 password, malformed PEM, wrong passphrase) |
+| `Apple.WwdrCertificateError` | `Apple.layer` | the supplied `wwdr` PEM failed to parse |
+| `Apple.CertificateExpiredError` | `Apple.layer` | signing cert's `notAfter` is already past, checked against the clock at layer build |
+| `Apple.AssetResolveError` | `Apple.pkpass` | an `Asset.file`/`Asset.url` couldn't be read/fetched to bytes for a given role + density |
+| `Apple.SigningError` | `Apple.pkpass` | the CMS/PKCS#7 signing step itself failed |
+| `Fidelity.UnsupportedError` | `Apple.pkpass` | a `Fidelity.audit` finding was enforced under `onUnsupported: "error"` |
+| `Pass.ValidationError` | `Apple.pkpass` | `Pass.validate` rejected the pass (bad slot arity, duplicate keys, …) before any Apple-specific work ran |
+
+Every one of these is a `Data.TaggedError` — pattern-match on `_tag` in an
+`Effect.catchTags`/`Effect.catchTag`, or let them propagate as a typed
+failure in `R`/error channel.
+
+## Related
+
+- [`Pass`](/docs/Pass) — the IR compiled here.
+- [`Fidelity`](/docs/Fidelity) — what Apple can't represent, and the
+  `onUnsupported` policy.
+- [`Google`](/docs/Google) — the other compile target.
+- [`Wallet`](/docs/Wallet) — run both targets concurrently in one call.
+- [`AppleWebService`](/docs/AppleWebService) / [`Registry`](/docs/Registry) —
+  the update/push side, once a pass with `webService` set is out in the wild.

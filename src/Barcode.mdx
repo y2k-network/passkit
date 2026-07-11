@@ -1,0 +1,102 @@
+---
+title: Barcode
+description: The four barcode symbologies both Apple and Google Wallet render.
+---
+
+`Barcode` models the intersection of what Apple Wallet's `PKBarcodeFormat`
+and Google Wallet's `barcode.type` both support: `Qr`, `Aztec`, `Pdf417`, and
+`Code128`. Nothing platform-exclusive lives in the core `Pass` IR — that's
+the covenant behind [`Pass`](/docs/Pass) as a whole, and `Barcode` is where
+it's most concrete. If a symbology only one target renders, it doesn't
+belong here.
+
+## Constructors
+
+```ts
+import { describe, expect, test } from "bun:test"
+import { Barcode } from "@y2k-network/passkit"
+
+test("constructors produce tagged values", () => {
+  const qr = Barcode.Qr({ content: "TKT-1", altText: "TKT-1" })
+  expect(qr._tag).toBe("Qr")
+  expect(qr.content).toBe("TKT-1")
+  expect(Barcode.$is("Qr")(qr)).toBe(true)
+  expect(Barcode.$is("Aztec")(qr)).toBe(false)
+})
+
+test("all four symbologies construct", () => {
+  expect(Barcode.Aztec({ content: "a" })._tag).toBe("Aztec")
+  expect(Barcode.Pdf417({ content: "a" })._tag).toBe("Pdf417")
+  expect(Barcode.Code128({ content: "a" })._tag).toBe("Code128")
+})
+```
+
+`Barcode` is a `Data.taggedEnum`, so `Barcode.$is` and `Barcode.$match` work
+the way they do everywhere else in the library — `$is("Qr")` narrows,
+`$match` handles all four tags exhaustively.
+
+Attach a barcode to a pass with [`Pass.barcode`](/docs/Pass):
+
+```ts
+import { Pass } from "@y2k-network/passkit"
+
+const withBarcode = Pass.eventTicket({
+  serial: Pass.Serial("TKT-2"),
+  description: "Effect Days"
+}).pipe(Pass.barcode(Barcode.Qr({ content: "TKT-2", altText: "TKT-2" })))
+```
+
+## Options: `altText` and `encoding`
+
+Every symbology takes the same three fields — `content` (required),
+`altText` (optional human-readable fallback shown under the barcode on both
+platforms), and `encoding` (optional, defaults to platform default):
+
+```ts
+test("encoding is optional on all four symbologies", () => {
+  expect(Barcode.Aztec({ content: "a", encoding: "iso-8859-1" }).encoding).toBe("iso-8859-1")
+  expect(Barcode.Pdf417({ content: "a", encoding: "utf-8" }).encoding).toBe("utf-8")
+  expect(Barcode.Code128({ content: "a", encoding: "utf-8" }).encoding).toBe("utf-8")
+})
+```
+
+`BarcodeEncoding` is `"iso-8859-1" | "utf-8"` — it maps directly onto
+Apple's `PKBarcode.messageEncoding`, which expects an IANA character set
+name for the scanner to interpret `content` with. Google Wallet has no
+equivalent field (it assumes UTF-8), so `encoding` is a no-op on that
+target — set it when Apple compatibility with non-UTF-8 scanning hardware
+matters, leave it unset otherwise.
+
+## Wire encoding (`Barcode.Schema`)
+
+Like `Field`, `Barcode`'s `Data.taggedEnum` values don't round-trip through
+`Schema.declare` directly in this v4 beta, so `Barcode.BarcodeSchema`
+decodes/encodes a structurally-equivalent plain tagged struct:
+
+```ts
+import * as Schema from "effect/Schema"
+
+test("schema round-trip", () => {
+  const encoded = Schema.encodeSync(Barcode.BarcodeSchema)(Barcode.Qr({ content: "x" }))
+  const decoded = Schema.decodeUnknownSync(Barcode.BarcodeSchema)(encoded)
+  expect(decoded).toEqual({ _tag: "Qr", content: "x" })
+})
+
+test("schema decode of legacy barcode JSON without encoding still works", () => {
+  const legacy = { _tag: "Qr", content: "legacy" }
+  const decoded = Schema.decodeUnknownSync(Barcode.BarcodeSchema)(legacy)
+  expect(decoded).toEqual({ _tag: "Qr", content: "legacy" })
+  expect(decoded.encoding).toBeUndefined()
+})
+```
+
+`encoding` and `altText` are both `Schema.optional`, so older encoded
+barcodes (from before `encoding` existed, or ones that never set it) decode
+cleanly — useful if you're persisting passes across a schema migration.
+
+## See also
+
+- [Pass](/docs/Pass) — `Pass.barcode` attaches a `Barcode` to a pass.
+- [Field](/docs/Field) — the other typed-value primitive in the IR, same
+  `Data.taggedEnum` + companion-`Schema` pattern.
+- [Fidelity](/docs/Fidelity) — what else is and isn't shared across targets.

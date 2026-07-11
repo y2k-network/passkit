@@ -1,0 +1,304 @@
+---
+title: Google
+description: The Google Wallet compile target — Issuer + AssetHost services, saveLink JWTs, and REST sync.
+---
+
+`Google` is the second compile target off the neutral [`Pass`](/docs/Pass) IR
+(DESIGN.md §5.2). Where Apple wants a signed zip of bytes, Google Wallet
+wants a REST object referenced from an RS256 JWT — so this module has two
+entrypoints instead of one: `Google.saveLink` (skinny, self-contained,
+no API call) and `Google.sync` (server-side, updatable, upserted via REST).
+Both compile the same `Pass` through the same class/object mapping; they
+differ only in where the compiled data ends up.
+
+## `Issuer` — your Wallet identity
+
+```ts
+export interface IssuerShape {
+  readonly issuerId: string
+  readonly serviceAccount: ServiceAccount
+  readonly restBaseUrl?: string  // override the Wallet Objects API base URL — tests, non-default universes
+  readonly tokenUrl?: string     // override the OAuth2 token endpoint — tests
+}
+```
+
+Build it with `Google.layer`, from a service account JSON key:
+
+```ts
+import { Google } from "@y2k-network/passkit"
+
+const GoogleLive = Google.layer({
+  issuerId: "3388000000012345678",
+  serviceAccount: { json: await Bun.file(saPath).text() }
+})
+// Layer<Google.Issuer, Google.ServiceAccountError>
+```
+
+<AutoTypeTable path="../src/Google.ts" name="LayerConfig" />
+
+`serviceAccount.json` is the raw JSON text of a Google Cloud service account
+key with Wallet Objects API access — read the file yourself (e.g.
+`Bun.file(path).text()`); the library doesn't touch the filesystem for you.
+Parsing/shape failures surface as `Google.ServiceAccountError`.
+
+In tests, build an `Issuer` layer directly without going through JSON:
+
+```ts
+const serviceAccount: Google.ServiceAccount = {
+  type: "service_account",
+  project_id: "test-project",
+  private_key_id: "key-id-1",
+  private_key: Redacted.make(privateKey),
+  client_email: "wallet@test-project.iam.gserviceaccount.com"
+}
+
+const issuerLayer = Layer.succeed(Google.Issuer, { issuerId: "3388000000012345678", serviceAccount })
+```
+
+Note `private_key` is `Redacted.Redacted<string>` on `ServiceAccount` — it
+never round-trips through a plain string once loaded.
+
+## `AssetHost` — hosting bytes Google can fetch
+
+The deepest asymmetry with Apple: Apple embeds image **bytes** in the signed
+bundle, Google references **hosted URLs**. `AssetHost` is the capability
+that turns an `Asset.File`/`Asset.Bytes` into a URL:
+
+```ts
+export interface AssetHostShape {
+  readonly upload: (
+    bytes: Uint8Array,
+    hint: { readonly role: Pass.AssetRole; readonly density: "1x" | "2x" | "3x" }
+  ) => Effect.Effect<string, unknown>
+}
+```
+
+Provide a layer backed by R2/S3/GCS/your own CDN. Both `Google.saveLink` and
+`Google.sync` require `AssetHost` in `R` **unconditionally** — not only when
+a non-`Url` asset is actually present. That's a real constraint of Effect v4
+service resolution, not an oversight: a pass's `R` can't be conditioned on
+its runtime data (which assets it happens to carry), only on its type. If
+every asset on your passes is already `Asset.url(...)`, provide
+`AssetHost.layerNoop`:
+
+```ts
+class AssetHost extends Context.Service<AssetHost, AssetHostShape>()(
+  "effect-passkit/Google/AssetHost"
+) {
+  static readonly layerNoop: Layer.Layer<AssetHost> = Layer.succeed(AssetHost, {
+    upload: (_bytes, hint) =>
+      Effect.fail(new MissingAssetHostError({
+        role: hint.role,
+        density: hint.density,
+        message: `Asset for role "${hint.role}" (${hint.density}) needs an AssetHost ...`
+      }))
+  })
+}
+```
+
+`layerNoop` isn't a silent stub — it fails loudly, naming the exact
+offending role/density, the moment a `File`/`Bytes` asset shows up and your
+"every asset is a URL" assumption turns out to be wrong:
+
+```ts
+test("fails with a named MissingAssetHostError when a Bytes asset needs a host under layerNoop", async () => {
+  const pass = eventTicket().pipe(Pass.hero(Asset.bytes(new Uint8Array([1, 2, 3]))))
+  const program = Google.saveLink(pass).pipe(
+    Effect.provide(issuerLayer),
+    Effect.provide(Google.AssetHost.layerNoop)
+  )
+
+  const exit = await Effect.runPromiseExit(program)
+  expect(exit._tag).toBe("Failure")
+  if (exit._tag === "Failure") {
+    const asString = JSON.stringify(exit.cause)
+    expect(asString).toContain("GoogleMissingAssetHostError")
+    expect(asString).toContain("hero")
+  }
+})
+```
+
+A real host is just a function:
+
+```ts
+const fakeHost = Layer.succeed(Google.AssetHost, {
+  upload: () => Effect.succeed("https://cdn.test/x.png")
+})
+
+const pass = eventTicket().pipe(Pass.logo(Asset.bytes(new Uint8Array([1, 2, 3]))))
+const link = await Effect.runPromise(
+  Google.saveLink(pass).pipe(Effect.provide(issuerLayer), Effect.provide(fakeHost))
+)
+// claims.payload.eventTicketClasses[0].logo === { sourceUri: { uri: "https://cdn.test/x.png" } }
+```
+
+`Asset.File` specifically can't be resolved inside `Google.saveLink`/`sync`
+directly — there's no filesystem step in this path — so a `File` asset
+always routes through `AssetHost.upload` (which fails under `layerNoop` just
+like `Bytes` does); resolve it to bytes yourself first if you need
+file-backed assets on Google.
+
+## `Google.saveLink` — the skinny JWT
+
+```ts
+const link = await Effect.runPromise(
+  Google.saveLink(pass).pipe(Effect.provide(issuerLayer), Effect.provide(Google.AssetHost.layerNoop))
+)
+// Effect<Google.SaveLink, Google.IssueError, Google.Issuer | Google.AssetHost>
+
+link.url  // "https://pay.google.com/gp/v/save/<jwt>" — redirect the user here, no API call needed
+link.jwt  // the signed token itself, if you want to render your own "Add to Google Wallet" button
+```
+
+The whole compiled class **and** object are embedded in the JWT payload
+itself — Google Wallet decodes and upserts them client-side on save. No
+network round-trip from your server, but also no way to push updates to a
+pass issued this way; see `Google.sync` for that.
+
+```ts
+export interface SaveLinkOptions {
+  readonly origins?: ReadonlyArray<string>
+  readonly classSuffix?: string
+  readonly onUnsupported?: Fidelity.OnUnsupported // default "warn"
+}
+```
+
+```ts
+const link = await Effect.runPromise(
+  Google.saveLink(eventTicket(), { classSuffix: "vip", origins: ["https://example.com"] }).pipe(
+    Effect.provide(issuerLayer),
+    Effect.provide(Google.AssetHost.layerNoop)
+  )
+)
+const { claims } = decodeJwt(link.jwt)
+claims.origins                                        // ["https://example.com"]
+claims.payload.eventTicketClasses[0].id                // "3388000000012345678.vip"
+```
+
+`classSuffix` lets one issuer/pass-kind pair mint multiple Wallet classes
+(e.g. a `"vip"` tier vs. the default `"evt"` suffix derived from the pass
+kind) without a second `Issuer`. `origins` restricts which web origins may
+trigger the save button, per Google Wallet's JWT `origins` claim.
+
+The compile pipeline mirrors Apple's shape: `Pass.validate` ->
+`Fidelity.enforce` (against `Fidelity.audit(validated).google`, default
+`"warn"`) -> compile to class/object -> resolve any non-`Url` assets through
+`AssetHost` -> build and sign the save JWT claims -> `SaveLink`.
+
+## `Google.sync` — server-side, updatable
+
+```ts
+const result = await Effect.runPromise(
+  Google.sync(pass, {}).pipe(Effect.provide(issuerLayer), Effect.provide(Google.AssetHost.layerNoop))
+)
+// Effect<Google.SyncResult, Google.SyncError, Google.Issuer | Google.AssetHost>
+// { classId: "3388000000012345678.evt", objectId: "3388000000012345678.evt-sync-1" }
+```
+
+Use `sync` instead of `saveLink` when the pass needs to live server-side so
+you can push updates to it later (Google Wallet notifies devices when an
+object it's tracking changes). Each of the class and the object is `GET`
+first; a `404` inserts via `POST`, anything else patches via `PATCH`:
+
+```ts
+// First sync: GET (404) then POST for class, and GET (404) then POST for object.
+const methodsFirst = requests.map((r) => `${r.method} ${r.path}`)
+expect(methodsFirst).toEqual([
+  "GET /walletobjects/v1/eventTicketClass/3388000000012345678.evt",
+  "POST /walletobjects/v1/eventTicketClass",
+  "GET /walletobjects/v1/eventTicketObject/3388000000012345678.evt-sync-1",
+  "POST /walletobjects/v1/eventTicketObject"
+])
+```
+
+Authorization for the REST calls is a separate OAuth2 JWT-bearer flow — not
+the save JWT — signed with the same service account and exchanged at
+`tokenUrl` (or the default Google token endpoint) for a bearer access token
+before the class/object upserts run:
+
+```ts
+const { claims, verified } = verifyAssertion(lastAssertion!)
+verified                // true — RS256 over the service account's private key
+claims.iss               // serviceAccount.client_email
+claims.aud                // tokenUrl
+claims.scope               // "https://www.googleapis.com/auth/wallet_object.issuer"
+claims.exp - claims.iat    // 3600
+```
+
+`SyncOptions` is `{ classSuffix?, onUnsupported? }` — the same shape as
+`SaveLinkOptions` minus `origins` (there's no save-button JWT to scope).
+
+## Image role mapping
+
+`Pass`'s asset roles (`icon`, `logo`, `strip`, `hero`, `thumbnail`) don't map
+1:1 onto Google Wallet's class fields — Google has far fewer image slots
+than Apple:
+
+- **`logo`** -> the kind's logo field (`logo` on most kinds; loyalty/offer
+  kinds use their own field name internally).
+- **`hero`** -> Google Wallet's single `heroImage` slot. If `hero` is unset
+  but `strip` is set, `strip` is **approximated** as the hero image (a
+  `Fidelity.Approximated` finding — Apple's strip and Google's hero aren't
+  quite the same aspect ratio/purpose, but it's the closest fit). If both are
+  set, `hero` wins outright and `strip` is dropped for Google.
+- **`icon`, `thumbnail`** -> **dropped**. Google Wallet has no field for
+  either on any pass kind, on any target. They're never even sent to
+  `AssetHost.upload` — no wasted uploads for a field that doesn't exist:
+
+```ts
+test("icon/thumbnail assets are never uploaded — Google Wallet has no field for them", async () => {
+  const pass = eventTicket().pipe(
+    Pass.icon(Asset.bytes(new Uint8Array([1, 2, 3]))),
+    Pass.thumbnail(Asset.bytes(new Uint8Array([4, 5, 6]))),
+    Pass.hero(Asset.url("https://cdn.example.com/hero.png"))
+  )
+  const link = await Effect.runPromise(
+    Google.saveLink(pass).pipe(Effect.provide(issuerLayer), Effect.provide(fakeHost))
+  )
+  const cls = decodeJwt(link.jwt).claims.payload.eventTicketClasses[0]
+
+  expect(calls).toEqual([])                 // no upload calls for icon/thumbnail
+  expect(cls.heroImage).toEqual({ sourceUri: { uri: "https://cdn.example.com/hero.png" } })
+  expect(cls.icon).toBeUndefined()
+  expect(cls.thumbnail).toBeUndefined()
+})
+```
+
+Every one of these mappings — and every field Google can't represent at all
+(beacons, Apple-only relevance, a sixth secondary field) — is reported by
+[`Fidelity.audit`](/docs/Fidelity), not silently swallowed. Run it in a test
+and snapshot `.google` findings so your CI knows exactly what Google Wallet
+users don't get.
+
+## Error taxonomy
+
+```ts
+export type IssueError =
+  | Pass.ValidationError
+  | Google.MissingAssetHostError
+  | Google.AssetUploadError
+  | Jwt.JwtError
+  | Google.ServiceAccountError
+  | Fidelity.UnsupportedError
+
+export type SyncError = IssueError | Rest.TokenError | Rest.ApiError
+```
+
+| Error | Raised by | Meaning |
+| --- | --- | --- |
+| `Pass.ValidationError` | both | `Pass.validate` rejected the pass before any Google-specific work ran |
+| `Google.MissingAssetHostError` | both | a non-`Url` asset needed `AssetHost.upload` and none was configured (`layerNoop`, or a `File` asset with no host) |
+| `Google.AssetUploadError` | both | `AssetHost.upload` itself failed |
+| `Jwt.JwtError` | `saveLink` | signing the save JWT failed |
+| `Google.ServiceAccountError` | `Google.layer`, both | the service account JSON/key failed to parse or is missing required fields |
+| `Fidelity.UnsupportedError` | both | a `Fidelity.audit(...).google` finding was enforced under `onUnsupported: "error"` |
+| `Rest.TokenError` | `sync` only | the OAuth2 JWT-bearer token exchange failed |
+| `Rest.ApiError` | `sync` only | a Wallet Objects REST call (`GET`/`POST`/`PATCH`) returned an error status |
+
+## Related
+
+- [`Pass`](/docs/Pass) — the IR compiled here.
+- [`Fidelity`](/docs/Fidelity) — the full lossiness model, `onUnsupported`
+  policy, and what `Approximated`/`Dropped`/`Resized` mean.
+- [`Apple`](/docs/Apple) — the other compile target.
+- [`Wallet`](/docs/Wallet) — run both targets concurrently in one call.

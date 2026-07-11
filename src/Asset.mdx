@@ -1,0 +1,132 @@
+---
+title: Asset
+description: Resolvable images — Apple embeds bytes, Google references hosted URLs — and what that costs in R.
+---
+
+`Asset` models images the way the two platforms actually consume them, not
+the way a naive "just pass a path" API would pretend they're the same thing.
+Apple's `.pkpass` is a signed zip: icons, logos, strips all travel as bytes
+*inside* the bundle. Google Wallet objects are JSON: an image is a URL the
+Google Wallet app fetches at render time. Those aren't two encodings of one
+concept — they're two different resource models, and `Asset` makes the
+difference a type you can see rather than a runtime surprise.
+
+## Constructors
+
+```ts
+import { describe, expect, test } from "bun:test"
+import { Asset } from "@y2k-network/passkit"
+
+describe("Asset", () => {
+  test("file/url/bytes constructors", () => {
+    expect(Asset.file("logo.png")).toEqual({ _tag: "File", path: "logo.png" })
+    expect(Asset.url("https://cdn/logo.png")).toEqual({ _tag: "Url", url: "https://cdn/logo.png" })
+    const bytes = new Uint8Array([1, 2, 3])
+    expect(Asset.isBytes(Asset.bytes(bytes))).toBe(true)
+  })
+})
+```
+
+`Asset` is a `Data.TaggedEnum` with three variants — `File`, `Url`, `Bytes`
+— plus `Asset.isFile`/`isUrl`/`isBytes` guards and `Asset.$match` for
+exhaustive handling. There's no fourth variant for "figure it out from the
+string" — the tag is the whole point.
+
+## The asymmetry, and what it costs in `R`
+
+Each variant is free on one platform and costs a requirement on the other:
+
+```ts
+Asset.file("assets/logo.png")      // Apple: free (FileSystem). Google: needs Google.AssetHost to upload -> URL
+Asset.url("https://cdn/logo.png")  // Google: free. Apple: fetched at compile (needs HttpClient)
+Asset.bytes(uint8array)            // Apple: free. Google: needs Google.AssetHost
+```
+
+This is the payoff of routing everything through Effect's `R`: the type of
+`Apple.pkpass(pass)` or `Google.saveLink(pass)` literally tells you whether
+you need an asset pipeline before you've written one. Ship a pass built
+entirely from `Asset.url` and Google's `R` costs you nothing extra; reach
+for `Asset.file` anywhere and `Google.AssetHost` shows up in the signature,
+non-negotiable.
+
+[`Google.AssetHost`](/docs/Google) is a small service —
+`upload: (bytes, hint) => Effect<string, unknown>` — that you provide a
+layer for (R2, S3, GCS, your own CDN). It's required in
+`Google.saveLink`/`Google.sync`'s `R` **unconditionally**, not just when a
+non-`Url` asset is actually present, because v4's service resolution can't
+make a requirement conditional on runtime data. `Google.AssetHost.layerNoop`
+is the honest default when every asset on your passes is already
+`Asset.Url`: it fails loudly, naming the offending asset, the moment that
+assumption breaks, rather than silently doing nothing. If your assets really
+are all URLs, the upload function is simply never called.
+
+[`Apple.pkpass`](/docs/Apple) has the mirror-image concern: an `Asset.Url`
+means Apple has to fetch the bytes at compile time (`Apple.AssetResolveError`
+on failure), which is why `HttpClient` shows up in Apple's `R` too. `Asset.File`
+and `Asset.Bytes` are free there — Apple just reads/embeds them.
+
+## Density variants — `AssetSet`
+
+Apple wants `@1x`/`@2x`/`@3x` PNGs for a single image role; Google wants one
+URL and does its own scaling. Rather than filename-magic (`icon@2x.png`
+guessed from `icon.png`), density variants are explicit:
+
+<AutoTypeTable path="../src/Asset.ts" name="AssetSet" />
+
+```ts
+import { Pass } from "@y2k-network/passkit"
+
+const p = Pass.eventTicket({ serial: Pass.Serial("TKT-2"), description: "Effect Days" }).pipe(
+  Pass.icon(Asset.file("assets/icon.png"), { "2x": Asset.file("assets/icon@2x.png") })
+)
+```
+
+`Asset.set(base, variants)` builds an `AssetSet` directly if you're not
+going through a `Pass` combinator:
+
+```ts
+test("set builds an AssetSet with density variants", () => {
+  const base = Asset.file("icon.png")
+  const s = Asset.set(base, { "2x": Asset.file("icon@2x.png") })
+  expect(s["1x"]).toBe(base)
+  expect(s["2x"]).toBeDefined()
+  expect(s["3x"]).toBeUndefined()
+})
+```
+
+Only `"1x"` is required — Google never looks past it, and Apple degrades
+gracefully without `@3x`.
+
+## Roles
+
+Roles are separate [`Pass`](/docs/Pass) combinators, not a parameter, because
+role validity is per-kind: `Pass.icon`, `Pass.logo`, `Pass.strip`,
+`Pass.hero`, `Pass.thumbnail`. Strip images don't exist on boarding passes;
+`hero` is Google-first and maps onto Apple's `strip.png` unless a real
+`strip` asset is also set (in which case `strip` wins). Where a role or
+variant genuinely can't survive a target, that shows up in
+[`Fidelity.audit`](/docs/Fidelity) rather than getting silently dropped.
+
+## Resolved bytes
+
+Once a target has actually fetched or read an asset, it becomes:
+
+<AutoTypeTable path="../src/Asset.ts" name="Resolved" />
+
+That's target-phase output, not something you construct — `Asset` itself
+only models the *unresolved* reference.
+
+## Serialization
+
+`Asset` doesn't round-trip through `Schema.declare` directly in this v4
+beta (same story as `Barcode` and `Field`), so `AssetSchema` decodes to and
+encodes from a structurally-equivalent plain tagged struct, and
+`AssetSetSchema` composes it for the `"1x"/"2x"/"3x"` shape. `Pass.Schema`
+uses both — see [`Pass`](/docs/Pass) for the full round-trip story.
+
+## See also
+
+- [`Pass`](/docs/Pass) — `Pass.icon`/`logo`/`strip`/`hero`/`thumbnail`, the combinators that actually attach an `Asset` or `AssetSet` to a pass.
+- [`Google`](/docs/Google) — `Google.AssetHost`, `layerNoop`, and why it's an unconditional requirement.
+- [`Apple`](/docs/Apple) — `Apple.AssetResolveError` and fetching `Asset.Url` at compile time.
+- [`Fidelity`](/docs/Fidelity) — what happens when a role or density variant can't survive a target.
